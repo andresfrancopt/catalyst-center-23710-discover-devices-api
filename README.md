@@ -13,6 +13,8 @@ Start Catalyst Center discovery jobs (`POST /dna/intent/api/v1/discovery`) from 
 
 [discovery_common.py](discovery_common.py) holds the shared, SDK-free logic: `.env` loading, credential profiles and lookup, IP validation, the discovery payload, and result verification.
 
+There is also a set of **fully standalone** scripts in [standalone/](standalone) that do the same jobs (plus credential management) without sharing any code; see [Standalone scripts](#standalone-scripts).
+
 ## Setup (Python 3.14.3, see `.python-version`)
 
 ```sh
@@ -124,6 +126,59 @@ python check_discovery.py <task-id> --timeout 0        # check once, do not wait
 
 It prints the same report and uses the same exit codes. It only needs the API login in `.env`, not the credential profiles.
 
+## Standalone scripts
+
+The scripts in [standalone/](standalone) each contain everything they need in one file, in labelled sections (settings, devices, credentials, verification, main flow). They import only the Python standard library and the packages in [requirements.txt](requirements.txt) (`catalystcentersdk`, `python-dotenv`, `requests`), never `discovery_common.py` or each other. That makes them easy to read top to bottom, and any one of them can be copied somewhere else together with a `.env` file.
+
+| Script | What it does |
+| --- | --- |
+| [standalone/discover_ips.py](standalone/discover_ips.py) | Discovery for the IPs in its `DEVICES` list |
+| [standalone/discover_csv.py](standalone/discover_csv.py) | Discovery for the IPs in a CSV file |
+| [standalone/check_task.py](standalone/check_task.py) | Check a task by ID (and optionally the devices it discovered) |
+| [standalone/manage_credentials.py](standalone/manage_credentials.py) | List, create and check global CLI and SNMPv2 read-only credentials |
+
+They read the **same `.env` variables** as the other scripts. The `.env` file is looked for next to the script first, then in the folder you run it from, so from the project root you can run `python standalone/discover_ips.py`. Unlike the other scripts, a `.env` file is **optional** here: if none is found, they use the settings already present in the environment (handy in a container or CI), and only complain, naming the missing settings, if required ones are absent. Variables set in the environment always win over `.env`. `check_task.py` and `manage_credentials.py` only need the API login variables.
+
+The discovery scripts behave exactly like `discover_ips_in_code.py` and `discover_from_csv.py`: credential profiles, ID-or-description lookup, `Single`/`Range`/`Multi Range` formatting, `--dry-run`, `--no-wait`, `--timeout`, `--raw`, and the same exit codes. Tests compare their results with `discovery_common.py` so the two sets cannot quietly drift apart.
+
+```sh
+python standalone/discover_ips.py --dry-run
+python standalone/discover_csv.py devices.csv --name-prefix office
+```
+
+### Checking a task by ID
+
+```sh
+python standalone/check_task.py <task-id>               # running, failed (code and reason) or completed
+python standalone/check_task.py <task-id> --discovery   # also report each device (ping, SNMP, CLI)
+python standalone/check_task.py --discovery-id <id>     # check a discovery directly
+python standalone/check_task.py <task-id> --timeout 0   # check once, do not wait
+```
+
+It works for any task, not only discovery. The exit code is `0` only when the task completed (and, with `--discovery`, every device is `OK`).
+
+### Creating and checking global credentials
+
+```sh
+python standalone/manage_credentials.py list
+python standalone/manage_credentials.py check CSS            # by description, ID or (CLI) username
+python standalone/manage_credentials.py create-cli --description lab-cli --username admin
+python standalone/manage_credentials.py create-snmp-ro --description lab-ro
+```
+
+- **Secrets:** the CLI password, the optional enable password and the SNMP read community are typed at a hidden prompt (twice). They are never accepted as command-line arguments, so they do not end up in your shell history or the process list, and they are never printed, including in error messages and `--raw` output.
+- **Unattended runs:** add `--from-env` and set `NEW_CLI_PASSWORD`, `NEW_CLI_ENABLE_PASSWORD` (optional) or `NEW_SNMP_RO_COMMUNITY` in the environment instead of prompting. Prefer exporting them in the shell for one run rather than saving them in `.env`.
+- **No duplicates:** if a credential of that type with the same description (ignoring case) already exists, the script reports its ID and changes nothing. It checks first, so you are not even asked for the secrets in that case.
+- **Confirmation:** after creating, the script lists the credentials again (waiting up to `--timeout` seconds, default 30) and only reports success when the new credential is really there. If the create call returns a task, the script follows it and reports the controller's error code and reason on failure.
+- **`--dry-run`** shows the request with the secrets masked and calls nothing; it needs neither a `.env` file nor a connection.
+- **Use the result:** put the description (for example `lab-cli`) or the reported ID into `CRED_<PROFILE>_CLI_IDS` / `CRED_<PROFILE>_SNMPV2_RO_IDS` in `.env`.
+
+The request fields (`description`, `username`, `password`, `enablePassword`, `comments` and `credentialType: GLOBAL` for CLI; `description`, `readCommunity`, `comments` and `credentialType` for SNMPv2) come from the SDK's own request schemas. What the controller returns from the create call was not confirmed against a live controller, which is why the script confirms by listing. Creating a credential changes the controller, so run `--dry-run` first.
+
+### The trade-off
+
+Because each file carries its own copy of the shared code (settings, IP and range handling, credential lookup, polling, redaction), a fix has to be applied in each file that has it. Use the standalone scripts when you want something simple to read or hand over; use the `discovery_common.py`-based scripts when you would rather maintain that code once.
+
 ## Version compatibility: please verify
 
 - SDK `catalystcentersdk` 3.1.6.0.0 has no 2.3.7.10 model. The scripts use the nearest earlier one (`2.3.7.9`) and turn off the SDK's request validation so the payload is sent exactly as supplied. The supplied body uses `timeOut` and `retryCount`, while the SDK's own model names these `timeout` and `retry`.
@@ -136,3 +191,5 @@ It prints the same report and uses the same exit codes. It only needs the API lo
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+The suite includes a test that every file in `standalone/` runs on its own from an otherwise empty folder, and tests that compare the standalone code with `discovery_common.py`.
