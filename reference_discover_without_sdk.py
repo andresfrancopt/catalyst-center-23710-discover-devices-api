@@ -26,6 +26,7 @@ token by hand, builds every request and sends it with `requests`, and has to
 turn HTTP errors into messages itself. Compare it with discover_ips_in_code.py.
 
     python reference_discover_without_sdk.py [--dry-run] [--no-wait] [--timeout N] [--raw]
+    python reference_discover_without_sdk.py [--netconf | --netconf-port N]
 """
 
 from __future__ import annotations
@@ -42,11 +43,14 @@ from discovery_common import (
     ConfigError,
     JobSubmissionError,
     Settings,
+    add_netconf_arguments,
     add_wait_arguments,
+    announce_netconf,
     apply_tls_policy,
     build_jobs,
     group_by_profile,
     load_settings,
+    netconf_port_from_args,
     print_reports,
     resolve_settings,
     run_jobs,
@@ -118,7 +122,11 @@ def main() -> int:
         "--dry-run", action="store_true", help="print the payloads without calling the API"
     )
     add_wait_arguments(parser)
+    add_netconf_arguments(parser)
     args = parser.parse_args()
+    # Optional NETCONF (off unless --netconf or --netconf-port is given).
+    netconf_port = netconf_port_from_args(args)
+    announce_netconf(netconf_port)
 
     try:
         # Step 1: read the settings ([credentials]: API login and profiles from .env) and check
@@ -132,7 +140,7 @@ def main() -> int:
                 "(not looked up yet).",
                 file=sys.stderr,
             )
-            for _profile, payload in build_jobs(groups, settings, JOB_NAME_PREFIX):
+            for _profile, payload in build_jobs(groups, settings, JOB_NAME_PREFIX, netconf_port):
                 print(json.dumps(payload, indent=2))
             return 0
 
@@ -155,7 +163,7 @@ def main() -> int:
                 "GET", CREDENTIAL_PATH, params={"credentialSubType": subtype}
             ),
         )
-        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX)
+        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX, netconf_port)
 
         # Step 4 [main task]: submit the discovery, once per credential profile. This only starts
         # it; the discovery keeps running on the controller.

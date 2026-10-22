@@ -26,6 +26,7 @@ Edit DEVICES, make sure .env is filled in, then run:
     python discover_ips_in_code.py            # submit, then wait and report the results
     python discover_ips_in_code.py --dry-run  # only show what would be sent
     python discover_ips_in_code.py --no-wait  # submit only (check later with check_discovery.py)
+    python discover_ips_in_code.py --netconf  # also use NETCONF on port 830 (or --netconf-port N)
 """
 
 from __future__ import annotations
@@ -44,11 +45,14 @@ from discovery_common import (
     ApiGetters,
     ConfigError,
     JobSubmissionError,
+    add_netconf_arguments,
     add_wait_arguments,
+    announce_netconf,
     apply_tls_policy,
     build_jobs,
     group_by_profile,
     load_settings,
+    netconf_port_from_args,
     print_reports,
     resolve_settings,
     run_jobs,
@@ -79,7 +83,11 @@ def main() -> int:
         "--dry-run", action="store_true", help="print the payloads without calling the API"
     )
     add_wait_arguments(parser)
+    add_netconf_arguments(parser)
     args = parser.parse_args()
+    # Optional NETCONF (off unless --netconf or --netconf-port is given).
+    netconf_port = netconf_port_from_args(args)
+    announce_netconf(netconf_port)
 
     try:
         # Step 1: read the settings ([credentials]: API login and profiles from .env) and check
@@ -93,7 +101,7 @@ def main() -> int:
                 "(not looked up yet).",
                 file=sys.stderr,
             )
-            for _profile, payload in build_jobs(groups, settings, JOB_NAME_PREFIX):
+            for _profile, payload in build_jobs(groups, settings, JOB_NAME_PREFIX, netconf_port):
                 print(json.dumps(payload, indent=2))
             return 0
 
@@ -119,7 +127,7 @@ def main() -> int:
             groups,
             lambda subtype: api.discovery.get_global_credentials(subtype),
         )
-        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX)
+        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX, netconf_port)
 
         # Step 4 [main task]: submit the discovery (POST /dna/intent/api/v1/discovery), once per
         # credential profile. This only starts it; the discovery keeps running on the controller.

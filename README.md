@@ -85,6 +85,18 @@ python discover_from_csv.py devices.csv --name-prefix office --dry-run
 python discover_from_csv.py devices.csv --name-prefix office
 ```
 
+## Optional NETCONF
+
+All discovery scripts (the root ones, the reference one and the two in `standalone/`) can also use NETCONF. It is **off by default**, so nothing changes unless you ask for it:
+
+```sh
+python discover_ips_in_code.py --netconf              # NETCONF on port 830
+python discover_from_csv.py devices.csv --netconf-port 8830   # another port
+python standalone/discover_csv.py devices.csv --netconf --dry-run
+```
+
+`--netconf` and `--netconf-port N` cannot be used together. When enabled, the discovery request gets a `netconfPort` field (a string, as the SDK documents it) and the scripts print one line saying so; `--dry-run` shows the field. The SDK notes that NETCONF "will need valid SSH credentials to work", so the SSH CLI credential in the profile is still required (the discovery keeps `protocolOrder` set to `ssh`). The switch applies to every profile in that run. I could not confirm against a live 2.3.7.10 controller that it accepts the field, so check with `--dry-run` first; if the controller rejects it, the task error shows why.
+
 ## With vs. without the SDK
 
 `reference_discover_without_sdk.py` does the same as script 1 with `requests`. The difference:

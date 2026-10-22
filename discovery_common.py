@@ -27,6 +27,7 @@ non-SDK reference script can reuse it.
 
 from __future__ import annotations
 
+import argparse
 import ipaddress
 import json
 import os
@@ -313,12 +314,15 @@ def address_list(ip_addresses: Sequence[str]) -> tuple[str, str]:
 
 
 def build_payload(
-    name: str, ip_addresses: Sequence[str], profile: CredentialProfile
+    name: str,
+    ip_addresses: Sequence[str],
+    profile: CredentialProfile,
+    netconf_port: int | None = None,
 ) -> dict[str, Any]:
     # The discovery type and IP list depend on the IPs (see address_list); the other
     # fields are fixed defaults.
     discovery_type, ip_list = address_list(ip_addresses)
-    return {
+    payload: dict[str, Any] = {
         "name": name,
         "discoveryType": discovery_type,
         "ipAddressList": ip_list,
@@ -328,17 +332,30 @@ def build_payload(
         "isAutoCdp": False,
         "globalCredentialIdList": profile.credential_ids,
     }
+    # Optional NETCONF: the controller also tries this port. The SDK documents the field as
+    # a string and says it needs valid SSH credentials, which every profile already has.
+    if netconf_port is not None:
+        payload["netconfPort"] = str(netconf_port)
+    return payload
 
 
 def build_jobs(
-    groups: Mapping[str, Sequence[str]], settings: Settings, name_prefix: str
+    groups: Mapping[str, Sequence[str]],
+    settings: Settings,
+    name_prefix: str,
+    netconf_port: int | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     prefix = name_prefix.strip()
     if not prefix:
         raise ConfigError("The discovery name prefix must not be blank")
     # One job per profile, so each group of devices is only tried with its own credentials.
     return [
-        (profile, build_payload("{}-{}".format(prefix, profile), ips, settings.profiles[profile]))
+        (
+            profile,
+            build_payload(
+                "{}-{}".format(prefix, profile), ips, settings.profiles[profile], netconf_port
+            ),
+        )
         for profile, ips in groups.items()
     ]
 
@@ -508,6 +525,54 @@ class JobReport:
     ok: bool
     lines: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+NETCONF_DEFAULT_PORT = 830
+
+
+def netconf_port_number(text: str) -> int:
+    """argparse type for --netconf-port: a TCP port from 1 to 65535."""
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("{!r} is not a port number".format(text)) from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535, not {}".format(port))
+    return port
+
+
+def add_netconf_arguments(parser: Any) -> None:
+    """Add the optional NETCONF flags. Without them the discovery is exactly as before."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--netconf",
+        action="store_true",
+        help="also use NETCONF on port {} (needs the SSH CLI credential of the profile)".format(
+            NETCONF_DEFAULT_PORT
+        ),
+    )
+    group.add_argument(
+        "--netconf-port",
+        type=netconf_port_number,
+        metavar="PORT",
+        help="also use NETCONF on this port instead of {}".format(NETCONF_DEFAULT_PORT),
+    )
+
+
+def netconf_port_from_args(args: Any) -> int | None:
+    """The NETCONF port chosen on the command line, or None when NETCONF is not requested."""
+    if args.netconf_port is not None:
+        return args.netconf_port
+    return NETCONF_DEFAULT_PORT if args.netconf else None
+
+
+def announce_netconf(port: int | None) -> None:
+    if port is not None:
+        print(
+            "NETCONF is on: port {} is added to each discovery (it needs the SSH CLI "
+            "credential in the profile).".format(port),
+            file=sys.stderr,
+        )
 
 
 def add_wait_arguments(parser: Any) -> None:

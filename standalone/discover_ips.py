@@ -32,6 +32,7 @@ requests (see requirements.txt). It does not import any other script.
     python discover_ips.py             # submit, then wait and report the results
     python discover_ips.py --dry-run   # only show what would be sent
     python discover_ips.py --no-wait   # submit only (check later with check_task.py)
+    python discover_ips.py --netconf   # also use NETCONF on port 830 (or --netconf-port N)
 """
 
 from __future__ import annotations
@@ -78,6 +79,7 @@ TIMEOUT_SECONDS = 5
 RETRY_COUNT = 3
 POLL_INTERVAL_SECONDS = 5
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
+NETCONF_DEFAULT_PORT = 830
 
 
 class ScriptError(RuntimeError):
@@ -308,11 +310,16 @@ def address_list(ip_addresses: Sequence[str]) -> tuple[str, str]:
     return "Multi Range", ",".join("{}-{}".format(start, end) for start, end in pairs)
 
 
-def build_payload(name: str, ip_addresses: Sequence[str], credential_ids: Sequence[str]) -> dict[str, Any]:
+def build_payload(
+    name: str,
+    ip_addresses: Sequence[str],
+    credential_ids: Sequence[str],
+    netconf_port: int | None = None,
+) -> dict[str, Any]:
     # The discovery type and IP list depend on the IPs (see address_list); the other
     # fields are fixed defaults.
     discovery_type, ip_list = address_list(ip_addresses)
-    return {
+    payload: dict[str, Any] = {
         "name": name,
         "discoveryType": discovery_type,
         "ipAddressList": ip_list,
@@ -322,6 +329,56 @@ def build_payload(name: str, ip_addresses: Sequence[str], credential_ids: Sequen
         "isAutoCdp": False,
         "globalCredentialIdList": list(credential_ids),
     }
+    # Optional NETCONF: the controller also tries this port. The SDK documents the field as
+    # a string and says it needs valid SSH credentials, which every profile already has.
+    if netconf_port is not None:
+        payload["netconfPort"] = str(netconf_port)
+    return payload
+
+
+def netconf_port_number(text: str) -> int:
+    """argparse type for --netconf-port: a TCP port from 1 to 65535."""
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("{!r} is not a port number".format(text)) from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535, not {}".format(port))
+    return port
+
+
+def add_netconf_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the optional NETCONF flags. Without them the discovery is exactly as before."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--netconf",
+        action="store_true",
+        help="also use NETCONF on port {} (needs the SSH CLI credential of the profile)".format(
+            NETCONF_DEFAULT_PORT
+        ),
+    )
+    group.add_argument(
+        "--netconf-port",
+        type=netconf_port_number,
+        metavar="PORT",
+        help="also use NETCONF on this port instead of {}".format(NETCONF_DEFAULT_PORT),
+    )
+
+
+def netconf_port_from_args(args: argparse.Namespace) -> int | None:
+    """The NETCONF port chosen on the command line, or None when NETCONF is not requested."""
+    if args.netconf_port is not None:
+        return args.netconf_port
+    return NETCONF_DEFAULT_PORT if args.netconf else None
+
+
+def announce_netconf(port: int | None) -> None:
+    if port is not None:
+        print(
+            "NETCONF is on: port {} is added to each discovery (it needs the SSH CLI "
+            "credential in the profile).".format(port),
+            file=sys.stderr,
+        )
 
 
 # ===========================================================================
@@ -561,7 +618,11 @@ def main() -> int:
                         help="seconds to wait per job for results (default: %(default)s)")
     parser.add_argument("--raw", action="store_true",
                         help="also print the controller's raw responses (secrets redacted)")
+    add_netconf_arguments(parser)
     args = parser.parse_args()
+    # Optional NETCONF (off unless --netconf or --netconf-port is given).
+    netconf_port = netconf_port_from_args(args)
+    announce_netconf(netconf_port)
 
     try:
         # Step 1: read the settings ([credentials]: API login and profiles from .env) and check
@@ -574,7 +635,7 @@ def main() -> int:
                   file=sys.stderr)
             for profile, ips in groups.items():
                 refs = settings.profiles[profile].cli + settings.profiles[profile].snmp
-                print(json.dumps(build_payload("{}-{}".format(JOB_NAME_PREFIX, profile), ips, refs), indent=2))
+                print(json.dumps(build_payload("{}-{}".format(JOB_NAME_PREFIX, profile), ips, refs, netconf_port), indent=2))
             return 0
 
         # Lab only: prints a warning when certificate checking is switched off in .env.
@@ -587,7 +648,7 @@ def main() -> int:
         jobs = []
         for profile, ips in groups.items():
             ids = resolve_credential_ids(api, settings.profiles[profile])
-            jobs.append((profile, build_payload("{}-{}".format(JOB_NAME_PREFIX, profile), ips, ids)))
+            jobs.append((profile, build_payload("{}-{}".format(JOB_NAME_PREFIX, profile), ips, ids, netconf_port)))
 
         # Step 4 [main task]: submit the discovery (POST /dna/intent/api/v1/discovery), once per
         # credential profile. This only starts it; the discovery keeps running on the controller.
