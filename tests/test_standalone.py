@@ -51,7 +51,8 @@ from test_scripts import CLI_CREDS, DEVICES, SNMP_CREDS, configure
 
 ROOT = Path(__file__).resolve().parent.parent
 STANDALONE = ROOT / "standalone"
-NAMES = ["discover_ips.py", "discover_csv.py", "check_task.py", "manage_credentials.py"]
+NAMES = ["discover_ips.py", "discover_csv.py", "check_task.py", "manage_credentials.py",
+         "list_devices.py"]
 
 
 def load(name: str):
@@ -93,8 +94,8 @@ def patched_env(case: unittest.TestCase, module, env: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 ALLOWED_IMPORTS = {
-    "__future__", "argparse", "csv", "dataclasses", "getpass", "ipaddress", "json", "os",
-    "pathlib", "re", "sys", "time", "typing",  # standard library
+    "__future__", "argparse", "csv", "dataclasses", "datetime", "difflib", "getpass", "ipaddress",
+    "json", "os", "pathlib", "re", "sys", "time", "typing",  # standard library
     "catalystcentersdk", "dotenv", "requests", "urllib3",  # declared in requirements.txt
 }
 

@@ -148,6 +148,7 @@ The scripts in [standalone/](standalone) each contain everything they need in on
 | [standalone/discover_csv.py](standalone/discover_csv.py) | Discovery for the IPs in a CSV file |
 | [standalone/check_task.py](standalone/check_task.py) | Check a task by ID (and optionally the devices it discovered) |
 | [standalone/manage_credentials.py](standalone/manage_credentials.py) | List, create and check global CLI and SNMPv2 read-only credentials |
+| [standalone/list_devices.py](standalone/list_devices.py) | List the devices in the inventory on screen and in a CSV file (pages through large inventories) |
 
 They read the **same `.env` variables** as the other scripts. The `.env` file is looked for next to the script first, then in the folder you run it from, so from the project root you can run `python standalone/discover_ips.py`. Unlike the other scripts, a `.env` file is **optional** here: if none is found, they use the settings already present in the environment (handy in a container or CI), and only complain, naming the missing settings, if required ones are absent. Variables set in the environment always win over `.env`. `check_task.py` and `manage_credentials.py` only need the API login variables.
 
@@ -186,6 +187,22 @@ python standalone/manage_credentials.py create-snmp-ro --description lab-ro
 - **Use the result:** put the description (for example `lab-cli`) or the reported ID into `CRED_<PROFILE>_CLI_IDS` / `CRED_<PROFILE>_SNMPV2_RO_IDS` in `.env`.
 
 The request fields (`description`, `username`, `password`, `enablePassword`, `comments` and `credentialType: GLOBAL` for CLI; `description`, `readCommunity`, `comments` and `credentialType` for SNMPv2) come from the SDK's own request schemas. What the controller returns from the create call was not confirmed against a live controller, which is why the script confirms by listing. Creating a credential changes the controller, so run `--dry-run` first.
+
+### Listing the inventory to screen and CSV
+
+```sh
+python standalone/list_devices.py                      # every device: table on screen + inventory-<date>-<time>.csv
+python standalone/list_devices.py --unassigned         # only devices that are not assigned to a site
+python standalone/list_devices.py --ip "10.48.90..*" --role ACCESS --reachability Unreachable
+python standalone/list_devices.py --with-site --output inventory.csv --overwrite
+python standalone/list_devices.py --no-csv             # screen only
+```
+
+- **Paging:** the SDK does **not** page for you. One request returns at most 500 devices (`limit` up to 500, `offset` starting at 1), and the controller's own documentation tells you to make repeated calls for more. The script asks for page after page (`offset` 1, 501, 1001, ...) and stops at the first page that is shorter than the page size, so inventories of any size are read completely. It stops with a clear error if the controller returns the same page twice (it ignored `offset`) or after an absurd number of pages. `--page-size N` (1-500) changes the page size, and progress is shown on stderr. The count endpoint is deliberately not used, because it supports fewer filters than the list.
+- **Columns:** the CSV has `id, hostname, management_ip, platform, family, role, software_version, serial_number, mac_address, reachability, collection_status, error_code, error_description, uptime, last_updated` (plus `site` with `--with-site`). The screen shows a narrower selection so lines stay readable.
+- **Filters** (one value or several separated by commas; `.*` is a wildcard): `--ip`, `--hostname`, `--family`, `--role`, `--reachability`. They are applied by the controller. `--unassigned` reads the paged "not assigned to a site" list and keeps only those devices.
+- **`--with-site`** adds each device's site, with one extra API call per device, so it is slower on large inventories (it is skipped for devices known to have no site). Devices whose site cannot be looked up are left blank.
+- **Output file:** `--output` (default `inventory-YYYYmmdd-HHMMSS.csv` in the current folder). An existing file is never replaced unless you add `--overwrite`. Values that start with `=`, `+`, `-` (other than plain negative numbers) or `@` get a leading quote, so a spreadsheet cannot run inventory text as a formula. The inventory files are git-ignored. It only reads from Catalyst Center. `--raw` also prints one raw device record (secrets redacted), to check the field names on your controller.
 
 ### The trade-off
 

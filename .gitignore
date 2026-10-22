@@ -2,3 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
+# environment data produced by the scripts
+sites_cache.json
+sites_cache.json.tmp
+inventory-*.csv
