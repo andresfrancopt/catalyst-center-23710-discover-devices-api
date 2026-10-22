@@ -34,9 +34,11 @@ from discovery_common import (
     ConfigError,
     JobReport,
     JobSubmissionError,
+    address_list,
     apply_tls_policy,
     build_jobs,
     build_payload,
+    collapse_ranges,
     group_by_profile,
     load_settings,
     match_credential,
@@ -191,7 +193,7 @@ class GroupingTests(unittest.TestCase):
 
 
 class PayloadTests(unittest.TestCase):
-    def test_payload_matches_supplied_body(self) -> None:
+    def test_payload_uses_a_start_end_range_for_contiguous_ips(self) -> None:
         s = settings()
         payload = build_payload(
             "discover-10.48.90.173-174",
@@ -203,13 +205,35 @@ class PayloadTests(unittest.TestCase):
             {
                 "name": "discover-10.48.90.173-174",
                 "discoveryType": "Range",
-                "ipAddressList": "10.48.90.173,10.48.90.174",
+                "ipAddressList": "10.48.90.173-10.48.90.174",
                 "protocolOrder": "ssh",
                 "timeOut": 5,
                 "retryCount": 3,
                 "isAutoCdp": False,
                 "globalCredentialIdList": ["cli-1", "snmp-1"],
             },
+        )
+
+    def test_address_list_formats(self) -> None:
+        self.assertEqual(address_list(["10.0.0.5"]), ("Single", "10.0.0.5"))
+        self.assertEqual(
+            address_list(["10.0.0.3", "10.0.0.1", "10.0.0.2"]),
+            ("Range", "10.0.0.1-10.0.0.3"),
+        )
+        self.assertEqual(
+            address_list(["10.0.0.1", "10.0.0.2", "10.0.0.9", "10.0.1.0"]),
+            ("Multi Range", "10.0.0.1-10.0.0.2,10.0.0.9-10.0.0.9,10.0.1.0-10.0.1.0"),
+        )
+        # 255 -> 256 crosses an octet boundary and is still contiguous.
+        self.assertEqual(
+            address_list(["10.0.0.255", "10.0.1.0"]), ("Range", "10.0.0.255-10.0.1.0")
+        )
+
+    def test_ranges_never_cover_addresses_that_were_not_listed(self) -> None:
+        # .1 and .3 with a gap at .2: must stay two separate entries.
+        self.assertEqual(
+            collapse_ranges(["10.0.0.1", "10.0.0.3"]),
+            [("10.0.0.1", "10.0.0.1"), ("10.0.0.3", "10.0.0.3")],
         )
 
     def test_jobs_are_one_per_profile_with_only_that_profiles_ids(self) -> None:
@@ -219,6 +243,7 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(jobs["default"]["name"], "office-default")
         self.assertEqual(jobs["default"]["globalCredentialIdList"], ["cli-1", "snmp-1"])
         self.assertEqual(jobs["branch"]["name"], "office-branch")
+        self.assertEqual(jobs["branch"]["discoveryType"], "Single")
         self.assertEqual(jobs["branch"]["ipAddressList"], "10.0.0.2")
         self.assertEqual(
             jobs["branch"]["globalCredentialIdList"], ["cli-2", "cli-3", "snmp-2"]

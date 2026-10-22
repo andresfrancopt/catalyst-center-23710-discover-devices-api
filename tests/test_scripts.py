@@ -139,7 +139,8 @@ class InCodeScriptTests(EnvironmentCase):
         payloads = [c.kwargs["payload"] for c in calls]
         self.assertEqual([p["name"] for p in payloads], ["discover-default", "discover-branch"])
         self.assertTrue(all(c.kwargs["active_validation"] is False for c in calls))
-        self.assertEqual(payloads[0]["ipAddressList"], "10.48.90.173,10.48.90.174")
+        self.assertEqual(payloads[0]["discoveryType"], "Range")
+        self.assertEqual(payloads[0]["ipAddressList"], "10.48.90.173-10.48.90.174")
         self.assertEqual(payloads[0]["globalCredentialIdList"], ["cli-1", "snmp-1"])
         self.assertEqual(payloads[1]["globalCredentialIdList"], ["cli-2", "cli-3", "snmp-2"])
         self.assertEqual(api.task.get_task_by_id.call_count, 2)

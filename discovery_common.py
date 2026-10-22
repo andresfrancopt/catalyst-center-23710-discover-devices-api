@@ -47,8 +47,8 @@ REQUEST_TIMEOUT_SECONDS = 30
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
 
-# Discovery settings taken from the supplied request body.
-DISCOVERY_TYPE = "Range"
+# Discovery settings taken from the supplied request body. The discovery type
+# and IP list are chosen per job by address_list() below.
 PROTOCOL_ORDER = "ssh"
 TIMEOUT_SECONDS = 5
 RETRY_COUNT = 3
@@ -263,13 +263,46 @@ def group_by_profile(
     return groups
 
 
+def collapse_ranges(ip_addresses: Sequence[str]) -> list[tuple[str, str]]:
+    """Merge IPv4 addresses into contiguous (start, end) pairs.
+
+    Only addresses that were listed are covered, never the gaps between them.
+    """
+    numbers = sorted({int(ipaddress.IPv4Address(ip)) for ip in ip_addresses})
+    pairs: list[list[int]] = []
+    for number in numbers:
+        if pairs and number == pairs[-1][1] + 1:
+            pairs[-1][1] = number
+        else:
+            pairs.append([number, number])
+    return [(str(ipaddress.IPv4Address(a)), str(ipaddress.IPv4Address(b))) for a, b in pairs]
+
+
+def address_list(ip_addresses: Sequence[str]) -> tuple[str, str]:
+    """Return (discoveryType, ipAddressList) in the format Catalyst Center expects.
+
+    One IP is 'Single' ("10.0.0.1"); one contiguous block is 'Range' with a
+    single start-end pair ("10.0.0.1-10.0.0.4"); anything else is 'Multi Range'
+    with comma-separated start-end pairs. A comma-separated list of bare IPs
+    is rejected by 'Range' ("IPAddress for Range Discovery is invalid").
+    """
+    pairs = collapse_ranges(ip_addresses)
+    if len(pairs) == 1:
+        start, end = pairs[0]
+        if start == end:
+            return "Single", start
+        return "Range", "{}-{}".format(start, end)
+    return "Multi Range", ",".join("{}-{}".format(start, end) for start, end in pairs)
+
+
 def build_payload(
     name: str, ip_addresses: Sequence[str], profile: CredentialProfile
 ) -> dict[str, Any]:
+    discovery_type, ip_list = address_list(ip_addresses)
     return {
         "name": name,
-        "discoveryType": DISCOVERY_TYPE,
-        "ipAddressList": ",".join(ip_addresses),
+        "discoveryType": discovery_type,
+        "ipAddressList": ip_list,
         "protocolOrder": PROTOCOL_ORDER,
         "timeOut": TIMEOUT_SECONDS,
         "retryCount": RETRY_COUNT,
