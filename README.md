@@ -10,6 +10,7 @@ Start Catalyst Center discovery jobs (`POST /dna/intent/api/v1/discovery`) from 
 | [discover_from_csv.py](discover_from_csv.py) | a CSV file | Catalyst Center SDK |
 | [reference_discover_without_sdk.py](reference_discover_without_sdk.py) | the `DEVICES` list (same as the first script) | plain `requests`, for comparison |
 | [check_discovery.py](check_discovery.py) | a task ID or discovery ID from an earlier run | Catalyst Center SDK |
+| [assign_devices_to_site.py](assign_devices_to_site.py) | `devices.csv` (`ip_address` + `site` columns); assigns devices to sites | Catalyst Center SDK |
 
 [discovery_common.py](discovery_common.py) holds the shared, SDK-free logic: `.env` loading, credential profiles and lookup, IP validation, the discovery payload, and result verification.
 
@@ -138,6 +139,57 @@ python check_discovery.py <task-id> --timeout 0        # check once, do not wait
 
 It prints the same report and uses the same exit codes. It only needs the API login in `.env`, not the credential profiles.
 
+## Assigning discovered devices to a site
+
+After a discovery, devices are in the inventory but **not assigned to a site**. Two scripts with the same behavior assign them: [assign_devices_to_site.py](assign_devices_to_site.py) (uses `discovery_common.py`) and [standalone/assign_site.py](standalone/assign_site.py) (self-contained). They use the same `devices.csv` as the discovery, with one more column, `site`:
+
+```csv
+ip_address,credential_profile,site
+10.48.90.173,default,Global/London/Building1/Floor1
+10.48.90.174,default,Global/London/Building1
+```
+
+The discovery scripts ignore the `site` column, so one file serves both. Sites are given **by name** (the full hierarchy) and translated to site IDs for you.
+
+```sh
+python assign_devices_to_site.py --refresh-sites           # read the sites and save a local copy
+python assign_devices_to_site.py devices.csv --dry-run     # read-only preview: nothing is changed
+python assign_devices_to_site.py devices.csv               # assign, then verify
+python assign_devices_to_site.py devices.csv --site "Global/London/Building1"   # for rows with no site
+python assign_devices_to_site.py devices.csv --wait-for-devices 300             # right after a discovery
+```
+
+(`standalone/assign_site.py` takes exactly the same options.)
+
+> **Reminder: refresh the site list when sites change.** To avoid asking Catalyst Center for every site on each run, the scripts keep a local copy of the site list in `sites_cache.json` (change the location with `--sites-cache`). It is created on the first run and is never refreshed by itself. If sites are **created or renamed in Catalyst Center, run the script with `--refresh-sites`**. A site name that is not in the copy stops the run and says so, with the closest names. The copy records which controller it came from (a copy for another controller is replaced) and its date; a note appears if it is older than 7 days. The reminder is also printed at the end of every run and at the top of each script.
+
+**What it does:**
+
+1. Reads the CSV and checks it before any API call (bad or repeated IPs, rows with no site; `--site` fills in rows that have none).
+2. Loads the site list from the local copy (reading it from Catalyst Center, paged, only the first time or with `--refresh-sites`), and resolves each site name to a site ID. Spaces around `/` and capitals do not matter. A site must be a **building or a floor**; all name problems are shown together.
+3. Finds the devices cheaply: it reads the paged "not assigned to a site" list **once** and matches the IPs itself, instead of asking about each IP. IPs not in that list are looked up in the inventory (a few per request), to tell **already assigned** from **not in the inventory**. `--wait-for-devices N` keeps looking for up to N seconds, for devices that have not appeared yet.
+4. Assigns: one request per site, at most 100 devices per request (the limit of the API), and waits for each task. A failed request does not stop the others.
+5. Verifies by reading the "not assigned" list again: a device only counts as `ASSIGNED` if it is really gone from it.
+
+**Rules:**
+
+- Only devices that are not assigned to any site are assigned. A device that **already has a site is skipped and reported (`ALREADY ASSIGNED`), never moved**. Provisioning and creating sites are not part of these scripts.
+- Access points and sensors must go to a floor, other devices to a building. The controller enforces this, and its error message is shown against the device.
+- `--dry-run` reads the sites and devices and prints what would happen (`TO ASSIGN`, `ALREADY ASSIGNED`, `NOT IN INVENTORY`), but sends nothing. Run it first. `--no-wait` submits only and prints the task IDs (check them with `standalone/check_task.py`). `--timeout`, `--raw` (prints one raw site and one raw device record, secrets redacted) work as in the other scripts.
+- **Exit code:** 0 when every device is assigned, was already assigned, or (in a dry run) would be assigned; 1 otherwise (a device not in the inventory, a failed or unfinished task, a site problem, an API error).
+
+Example output:
+
+```text
+Sites: using the list saved on 2026-10-22 20:04 UTC (814 sites: 12 area, 201 building, 601 floor).
+- 10.48.90.173    sw-1                 Global/London/Building1/Floor1  ASSIGNED
+- 10.48.90.174    sw-2                 Global/London/Building1  ALREADY ASSIGNED: already has a site; devices are never moved
+2 device(s). ALREADY ASSIGNED: 1, ASSIGNED: 1
+Reminder: site names are read from a local copy of the site list. ...
+```
+
+**To confirm on your controller:** this uses the newer assignment API (`POST /dna/intent/api/v1/networkDevices/assignToSite/apply`, which takes device IDs and a building or floor ID), the "not assigned to a site" list and the sites list. I tested the scripts against a simulated controller only. The field names assumed in the responses (sites: `id`, `nameHierarchy`, `type`; devices: `id`, `managementIpAddress`, `hostname`) could not be confirmed against a live 2.3.7.10 controller. A missing field never crashes the script (it shows up as a clear message or a blank), and `--raw` shows what your controller returns. `--refresh-sites` and `--dry-run` only read, so they are safe to try first.
+
 ## Standalone scripts
 
 The scripts in [standalone/](standalone) each contain everything they need in one file, in labelled sections (settings, devices, credentials, verification, main flow). They import only the Python standard library and the packages in [requirements.txt](requirements.txt) (`catalystcentersdk`, `python-dotenv`, `requests`), never `discovery_common.py` or each other. That makes them easy to read top to bottom, and any one of them can be copied somewhere else together with a `.env` file.
@@ -149,6 +201,7 @@ The scripts in [standalone/](standalone) each contain everything they need in on
 | [standalone/check_task.py](standalone/check_task.py) | Check a task by ID (and optionally the devices it discovered) |
 | [standalone/manage_credentials.py](standalone/manage_credentials.py) | List, create and check global CLI and SNMPv2 read-only credentials |
 | [standalone/list_devices.py](standalone/list_devices.py) | List the devices in the inventory on screen and in a CSV file (pages through large inventories) |
+| [standalone/assign_site.py](standalone/assign_site.py) | Assign devices to a site (the standalone twin of `assign_devices_to_site.py`) |
 
 They read the **same `.env` variables** as the other scripts. The `.env` file is looked for next to the script first, then in the folder you run it from, so from the project root you can run `python standalone/discover_ips.py`. Unlike the other scripts, a `.env` file is **optional** here: if none is found, they use the settings already present in the environment (handy in a container or CI), and only complain, naming the missing settings, if required ones are absent. Variables set in the environment always win over `.env`. `check_task.py` and `manage_credentials.py` only need the API login variables.
 

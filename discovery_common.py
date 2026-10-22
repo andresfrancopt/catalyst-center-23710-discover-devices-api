@@ -28,6 +28,8 @@ non-SDK reference script can reuse it.
 from __future__ import annotations
 
 import argparse
+import csv
+import difflib
 import ipaddress
 import json
 import os
@@ -36,6 +38,7 @@ import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -810,3 +813,442 @@ def print_reports(reports: Sequence[JobReport], raw: bool = False) -> int:
         if raw:
             print(json.dumps(redact(report.raw), indent=2, default=str))
     return 0 if all(report.ok for report in reports) else 1
+
+
+# ---------------------------------------------------------------------------
+# Paging, the local site cache, and assigning devices to a site.
+# ---------------------------------------------------------------------------
+
+DEFAULT_PAGE_SIZE = 500  # the controller's limit per request
+MAX_PAGES = 1000  # safety net against a loop that never ends
+ASSIGN_BATCH_SIZE = 100  # the most devices one assign request accepts
+INVENTORY_LOOKUP_CHUNK = 50  # IP addresses per inventory lookup
+SITE_CACHE_VERSION = 1
+SITE_CACHE_MAX_AGE_DAYS = 7
+DEVICE_SITE_TYPES = ("building", "floor")  # devices can only go to these
+ASSIGN_WAIT_INTERVAL_SECONDS = 10
+
+# Where each device ends up. TO ASSIGN is the plan (dry run); the rest are results.
+STATUS_TO_ASSIGN = "TO ASSIGN"
+STATUS_TASK_DONE = "TASK DONE"
+STATUS_ASSIGNED = "ASSIGNED"
+STATUS_ALREADY = "ALREADY ASSIGNED"
+STATUS_MISSING = "NOT IN INVENTORY"
+STATUS_SUBMITTED = "SUBMITTED"
+STATUS_PENDING = "PENDING"
+STATUS_FAILED = "FAILED"
+_OK_STATUSES = {STATUS_TO_ASSIGN, STATUS_ASSIGNED, STATUS_ALREADY, STATUS_SUBMITTED}
+
+SITE_REFRESH_REMINDER = (
+    "Reminder: site names are read from a local copy of the site list. If sites were created "
+    "or renamed in Catalyst Center, run this script again with --refresh-sites."
+)
+
+
+# [error handling] The controller returns at most 500 records per request and the SDK does
+# not page for you, so ask for page after page. Offsets start at 1.
+def fetch_pages(
+    fetch_page: Callable[[int, int], list[Mapping[str, Any]]],
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+    on_page: Callable[[int, int], None] | None = None,
+) -> list[Mapping[str, Any]]:
+    """Collect every record: fetch_page(offset, limit) is called for offset 1, 1 + size, ...
+
+    A page shorter than page_size is the last one. Stops with an error if the controller
+    returns the same page twice (it ignored the offset) or there are too many pages.
+    """
+    items: list[Mapping[str, Any]] = []
+    previous: list[Mapping[str, Any]] | None = None
+    for page_number in range(1, max_pages + 1):
+        offset = 1 + (page_number - 1) * page_size
+        page = fetch_page(offset, page_size)
+        if not page:
+            return items
+        if previous is not None and page == previous:
+            raise ConfigError(
+                "The controller returned the same page twice (offset {}), so paging does not "
+                "work as expected. Stopping with {} records read.".format(offset, len(items))
+            )
+        items.extend(page)
+        if on_page is not None:
+            on_page(page_number, len(items))
+        if len(page) < page_size:
+            return items
+        previous = page
+    raise ConfigError(
+        "More than {} pages of {} records. Narrow the search with a filter, or raise "
+        "the page size.".format(max_pages, page_size)
+    )
+
+
+@dataclass(frozen=True)
+class SiteApi:
+    """The calls the assignment needs. The SDK scripts fill these in with SDK methods."""
+
+    list_sites: Callable[[int, int], list[Mapping[str, Any]]]  # (offset, limit)
+    list_unassigned: Callable[[int, int], list[Mapping[str, Any]]]  # (offset, limit)
+    list_devices_by_ip: Callable[[Sequence[str], int, int], list[Mapping[str, Any]]]
+    assign: Callable[[str, Sequence[str]], Any]  # (site_id, device_ids) -> task response
+    get_task: Callable[[str], Any]
+
+
+# --- Site names and the local site cache -----------------------------------
+
+
+def normalize_site_name(text: str) -> str:
+    """'Global / London/Building1/ ' -> 'global/london/building1' (for matching only)."""
+    parts = [part.strip() for part in text.strip().split("/")]
+    return "/".join(part for part in parts if part).lower()
+
+
+def parse_sites(items: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Keep what the assignment needs from the controller's site records."""
+    sites: list[dict[str, str]] = []
+    for item in items:
+        site_id = str(item.get("id") or "").strip()
+        hierarchy = str(item.get("nameHierarchy") or item.get("siteNameHierarchy") or "").strip()
+        if not site_id or not hierarchy:
+            continue
+        sites.append({
+            "id": site_id,
+            "name": str(item.get("name") or hierarchy.rsplit("/", 1)[-1]),
+            "nameHierarchy": hierarchy,
+            "type": str(item.get("type") or "").strip().lower(),
+        })
+    return sorted(sites, key=lambda site: site["nameHierarchy"].lower())
+
+
+def site_type_counts(sites: Iterable[Mapping[str, str]]) -> str:
+    counts: dict[str, int] = {}
+    for site in sites:
+        key = site.get("type") or "unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join("{} {}".format(counts[key], key) for key in sorted(counts)) or "none"
+
+
+@dataclass(frozen=True)
+class SiteCache:
+    controller: str
+    fetched_at: datetime
+    sites: tuple[Mapping[str, str], ...]
+
+
+# [main task] Read every site from the controller (paged) and keep it in a local file, so
+# later runs do not need to ask for all sites again.
+def refresh_site_cache(
+    api: SiteApi,
+    controller: str,
+    path: Path,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> SiteCache:
+    sites = parse_sites(fetch_pages(api.list_sites, page_size))
+    if not sites:
+        raise ConfigError("The controller returned no sites, so the site list was not saved.")
+    cache = SiteCache(controller, now(), tuple(sites))
+    save_site_cache(path, cache)
+    return cache
+
+
+def save_site_cache(path: Path, cache: SiteCache) -> None:
+    document = {
+        "version": SITE_CACHE_VERSION,
+        "controller": cache.controller,
+        "fetched_at": cache.fetched_at.isoformat(),
+        "sites": list(cache.sites),
+    }
+    # Write to a temporary file first, so a crash never leaves a half-written cache.
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise ConfigError("Could not save the site list to {}: {}".format(path, exc)) from exc
+
+
+def load_site_cache(path: Path, controller: str) -> tuple[SiteCache | None, str]:
+    """Return (cache, "") or (None, why-it-cannot-be-used). A missing file is not an error."""
+    if not path.is_file():
+        return None, "no site list has been saved yet"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if document["version"] != SITE_CACHE_VERSION:
+            return None, "the saved site list has an unknown format"
+        if document["controller"] != controller:
+            return None, "the saved site list is for another controller ({})".format(document["controller"])
+        cache = SiteCache(
+            controller, datetime.fromisoformat(document["fetched_at"]), tuple(document["sites"])
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, "the saved site list in {} cannot be read".format(path)
+    return cache, ""
+
+
+def cache_note(cache: SiteCache, now: datetime) -> str:
+    age = (now - cache.fetched_at).days
+    note = "Sites: using the list saved on {:%Y-%m-%d %H:%M} UTC ({} sites: {}).".format(
+        cache.fetched_at.astimezone(timezone.utc), len(cache.sites), site_type_counts(cache.sites))
+    if age >= SITE_CACHE_MAX_AGE_DAYS:
+        note += " It is {} days old; consider --refresh-sites.".format(age)
+    return note
+
+
+# [error handling] A site name must match exactly one building or floor. When it does not,
+# say why and suggest the closest names, and remind the user how to refresh the list.
+def resolve_site(cache: SiteCache, name: str) -> Mapping[str, str]:
+    wanted = normalize_site_name(name)
+    matches = [site for site in cache.sites if normalize_site_name(site["nameHierarchy"]) == wanted]
+    if not matches:
+        usable = [s["nameHierarchy"] for s in cache.sites if s.get("type") in DEVICE_SITE_TYPES]
+        close = difflib.get_close_matches(name.strip(), usable, n=3, cutoff=0.6)
+        raise ConfigError(
+            "Site {!r} is not in the saved site list ({:%Y-%m-%d %H:%M} UTC).{} If the site was "
+            "created or renamed recently, run again with --refresh-sites.".format(
+                name, cache.fetched_at.astimezone(timezone.utc),
+                " Closest names: {}.".format("; ".join(close)) if close else "")
+        )
+    if len(matches) > 1:
+        raise ConfigError(
+            "Site {!r} matches {} sites ({}). Use the full name hierarchy.".format(
+                name, len(matches), "; ".join(s["nameHierarchy"] for s in matches))
+        )
+    site = matches[0]
+    # Only reject when the type is known: if the controller sent none, let it decide.
+    if site.get("type") and site["type"] not in DEVICE_SITE_TYPES:
+        raise ConfigError(
+            "Site {!r} is {} {}; devices can only be assigned to a building or a floor.".format(
+                name, "an" if site["type"][0] in "aeiou" else "a", site["type"])
+        )
+    return site
+
+
+def resolve_sites(cache: SiteCache, names: Iterable[str]) -> dict[str, Mapping[str, str]]:
+    """Resolve every distinct site name, reporting all the problems at once."""
+    resolved: dict[str, Mapping[str, str]] = {}
+    problems: list[str] = []
+    for name in dict.fromkeys(names):
+        try:
+            resolved[name] = resolve_site(cache, name)
+        except ConfigError as exc:
+            problems.append("- {}".format(exc))
+    if problems:
+        raise ConfigError("Some sites could not be resolved:\n" + "\n".join(problems))
+    return resolved
+
+
+# --- The CSV with the devices --------------------------------------------------
+
+
+def read_device_sites(csv_path: Path, default_site: str | None = None) -> list[tuple[str, str]]:
+    """(ip_address, site) pairs from the CSV. Rows with no site use default_site."""
+    rows: list[tuple[str, str | None]] = []
+    try:
+        with open(csv_path, encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            columns = {(name or "").strip(): name for name in reader.fieldnames or []}
+            if "ip_address" not in columns:
+                raise ConfigError("CSV needs an 'ip_address' column in its header row")
+            ip_column, site_column = columns["ip_address"], columns.get("site")
+            for row in reader:
+                ip = row.get(ip_column)
+                if ip is None or not ip.strip():
+                    raise ConfigError("CSV line {}: empty ip_address".format(reader.line_num))
+                site = (row.get(site_column) or "").strip() if site_column else ""
+                rows.append((normalize_ip(ip), site or default_site))
+    except csv.Error as exc:
+        raise ConfigError("Could not parse CSV: {}".format(exc)) from exc
+
+    if not rows:
+        raise ConfigError("CSV contains no devices")
+    seen: set[str] = set()
+    for ip, _ in rows:
+        if ip in seen:
+            raise ConfigError("IP address listed more than once: {}".format(ip))
+        seen.add(ip)
+    without_site = [ip for ip, site in rows if not site]
+    if without_site:
+        raise ConfigError(
+            "No site for {} device(s): {}. Add a 'site' column to the CSV, or give --site.".format(
+                len(without_site), ", ".join(without_site[:10]) + (" ..." if len(without_site) > 10 else ""))
+        )
+    return [(ip, str(site)) for ip, site in rows]
+
+
+# --- Finding the devices in the inventory --------------------------------------
+
+
+@dataclass
+class AssignItem:
+    ip: str
+    site_name: str
+    site_id: str = ""
+    site_path: str = ""
+    device_id: str = ""
+    hostname: str = ""
+    status: str = ""
+    detail: str = ""
+
+
+def _by_ip(devices: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    found: dict[str, Mapping[str, Any]] = {}
+    for device in devices:
+        try:
+            found[normalize_ip(str(device.get("managementIpAddress") or ""))] = device
+        except ConfigError:
+            continue  # a record without a usable management IP cannot be matched
+    return found
+
+
+def lookup_inventory(api: SiteApi, ips: Sequence[str]) -> dict[str, Mapping[str, Any]]:
+    """Inventory devices for these IPs, a few IPs per request (any device, assigned or not)."""
+    found: dict[str, Mapping[str, Any]] = {}
+    for start in range(0, len(ips), INVENTORY_LOOKUP_CHUNK):
+        chunk = list(ips[start:start + INVENTORY_LOOKUP_CHUNK])
+        found.update(_by_ip(fetch_pages(lambda offset, limit: api.list_devices_by_ip(chunk, offset, limit))))
+    return found
+
+
+# [main task] Find each CSV device cheaply: read the 'not assigned to a site' list once and
+# match the IPs here, instead of asking about every IP. IPs missing from that list are looked
+# up in the inventory, to tell "already has a site" from "not in the inventory (yet)".
+def locate_devices(
+    api: SiteApi,
+    ips: Sequence[str],
+    wait_seconds: float = 0,
+    interval: float = ASSIGN_WAIT_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, tuple[str, Mapping[str, Any]]]:
+    deadline = clock() + wait_seconds
+    while True:
+        unassigned = _by_ip(fetch_pages(api.list_unassigned))
+        others = [ip for ip in ips if ip not in unassigned]
+        inventory = lookup_inventory(api, others) if others else {}
+        located: dict[str, tuple[str, Mapping[str, Any]]] = {}
+        for ip in ips:
+            if ip in unassigned:
+                located[ip] = (STATUS_TO_ASSIGN, unassigned[ip])
+            elif ip in inventory:
+                located[ip] = (STATUS_ALREADY, inventory[ip])
+            else:
+                located[ip] = (STATUS_MISSING, {})
+        # --wait-for-devices: right after a discovery, devices can take a while to appear.
+        if all(status != STATUS_MISSING for status, _ in located.values()) or clock() >= deadline:
+            return located
+        sleep(min(interval, max(deadline - clock(), 0)))
+
+
+def plan_items(
+    rows: Sequence[tuple[str, str]],
+    sites: Mapping[str, Mapping[str, str]],
+    located: Mapping[str, tuple[str, Mapping[str, Any]]],
+) -> list[AssignItem]:
+    items: list[AssignItem] = []
+    for ip, site_name in rows:
+        status, device = located[ip]
+        site = sites[site_name]
+        item = AssignItem(
+            ip=ip, site_name=site_name, site_id=site["id"], site_path=site["nameHierarchy"],
+            device_id=str(device.get("id") or ""), hostname=str(device.get("hostname") or ""),
+            status=status,
+        )
+        if status == STATUS_ALREADY:
+            item.detail = "already has a site; devices are never moved"
+        elif status == STATUS_MISSING:
+            item.detail = "not in the inventory (is the discovery finished? try --wait-for-devices)"
+        elif not item.device_id:
+            item.status, item.detail = STATUS_FAILED, "the controller record has no device ID"
+        items.append(item)
+    return items
+
+
+# --- Assigning ---------------------------------------------------------------
+
+
+def chunked(values: Sequence[Any], size: int) -> list[list[Any]]:
+    return [list(values[start:start + size]) for start in range(0, len(values), size)]
+
+
+def wait_for_task(
+    api: SiteApi,
+    task_id: str,
+    timeout: float,
+    interval: float = POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[str, str]:
+    """Wait for a task. Returns ("done" | "failed" | "pending", message)."""
+    task, finished = _poll(lambda: api.get_task(task_id), _task_done, clock() + timeout, interval, sleep, clock)
+    body = _body(task)
+    if not finished:
+        return "pending", "task {} is still running after {}s".format(task_id, int(timeout))
+    if body.get("isError"):
+        code = body.get("errorCode")
+        reason = body.get("failureReason") or body.get("progress") or "no reason given"
+        return "failed", "{}{}".format("[{}] ".format(code) if code else "", reason)
+    return "done", ""
+
+
+# [main task] Assign the devices: one request per site, at most 100 devices each, then wait
+# for each request's task. A failed request does not stop the others.
+def run_assignments(
+    api: SiteApi,
+    items: Sequence[AssignItem],
+    timeout: float,
+    no_wait: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    by_site: dict[str, list[AssignItem]] = {}
+    for item in items:
+        if item.status == STATUS_TO_ASSIGN:
+            by_site.setdefault(item.site_id, []).append(item)
+    for site_id, group in by_site.items():
+        for chunk in chunked(group, ASSIGN_BATCH_SIZE):
+            # [error handling] Whatever goes wrong with this request is shown on its devices.
+            try:
+                response = api.assign(site_id, [item.device_id for item in chunk])
+                task_id = task_id_from_response(response)
+                if not task_id:
+                    raise ConfigError("the response has no task ID: {}".format(
+                        json.dumps(redact(response), default=str)))
+                if no_wait:
+                    state, message = "submitted", "task {}".format(task_id)
+                else:
+                    state, message = wait_for_task(api, task_id, timeout, sleep=sleep, clock=clock)
+            except Exception as exc:
+                state, message = "failed", "{}: {}".format(type(exc).__name__, exc)
+            status = {"done": STATUS_TASK_DONE, "submitted": STATUS_SUBMITTED,
+                      "pending": STATUS_PENDING, "failed": STATUS_FAILED}[state]
+            for item in chunk:
+                item.status, item.detail = status, message
+
+
+# Success is only reported if the devices really left the 'not assigned to a site' list.
+def verify_assignments(api: SiteApi, items: Sequence[AssignItem]) -> None:
+    waiting = [item for item in items if item.status == STATUS_TASK_DONE]
+    if not waiting:
+        return
+    still_unassigned = {str(device.get("id")) for device in fetch_pages(api.list_unassigned)}
+    for item in waiting:
+        if item.device_id in still_unassigned:
+            item.status = STATUS_FAILED
+            item.detail = "the task finished, but the device is still not assigned to a site"
+        else:
+            item.status, item.detail = STATUS_ASSIGNED, ""
+
+
+def assignment_report(items: Sequence[AssignItem]) -> tuple[list[str], bool]:
+    """One line per device, a summary line, and whether everything is fine."""
+    lines = []
+    for item in items:
+        lines.append("- {ip:<15} {host:<20} {site}  {status}{detail}".format(
+            ip=item.ip, host=item.hostname or "-", site=item.site_path or item.site_name,
+            status=item.status, detail=": " + item.detail if item.detail else ""))
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[item.status] = counts.get(item.status, 0) + 1
+    summary = ", ".join("{}: {}".format(status, counts[status]) for status in sorted(counts))
+    return lines + ["{} device(s). {}".format(len(items), summary)], all(
+        item.status in _OK_STATUSES for item in items)

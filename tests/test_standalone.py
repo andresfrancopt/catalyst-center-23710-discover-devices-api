@@ -52,7 +52,7 @@ from test_scripts import CLI_CREDS, DEVICES, SNMP_CREDS, configure
 ROOT = Path(__file__).resolve().parent.parent
 STANDALONE = ROOT / "standalone"
 NAMES = ["discover_ips.py", "discover_csv.py", "check_task.py", "manage_credentials.py",
-         "list_devices.py"]
+         "list_devices.py", "assign_site.py"]
 
 
 def load(name: str):
