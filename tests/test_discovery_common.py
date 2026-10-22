@@ -24,19 +24,29 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from discovery_common import (
+    CLI_SUBTYPE,
+    SNMPV2_RO_SUBTYPE,
+    ApiGetters,
     ConfigError,
+    JobReport,
     JobSubmissionError,
     apply_tls_policy,
     build_jobs,
     build_payload,
     group_by_profile,
     load_settings,
+    match_credential,
     normalize_ip,
+    print_reports,
+    resolve_settings,
     run_jobs,
+    task_id_from_response,
+    verify_job,
+    verify_submitted,
 )
 
 BASE_ENV = {
@@ -237,6 +247,245 @@ class RunJobsTests(unittest.TestCase):
             run_jobs([("p", {"name": "a"})], lambda payload: {"ok": 1}),
             [("p", {"ok": 1})],
         )
+
+
+class ProfilesOptionalTests(unittest.TestCase):
+    def test_check_scripts_do_not_need_profiles(self) -> None:
+        env = {k: v for k, v in BASE_ENV.items() if not k.startswith(("CRED", "CREDENTIAL"))}
+        s = load_settings(env, require_profiles=False)
+        self.assertEqual(dict(s.profiles), {})
+        with self.assertRaisesRegex(ConfigError, "CREDENTIAL_PROFILES"):
+            load_settings(env)
+
+
+CLI_ITEMS = [
+    {"id": "cli-uuid-1", "description": "CSS", "username": "admin", "password": "x"},
+    {"id": "cli-uuid-2", "description": "Other", "username": "ops"},
+]
+SNMP_ITEMS = [{"id": "snmp-uuid-1", "description": "RO", "readCommunity": "secret-community"}]
+
+
+class CredentialMatchTests(unittest.TestCase):
+    def test_matches_id_then_description_then_cli_username(self) -> None:
+        self.assertEqual(match_credential("cli-uuid-2", CLI_ITEMS, CLI_SUBTYPE), "cli-uuid-2")
+        self.assertEqual(match_credential(" css ", CLI_ITEMS, CLI_SUBTYPE), "cli-uuid-1")
+        self.assertEqual(match_credential("OPS", CLI_ITEMS, CLI_SUBTYPE), "cli-uuid-2")
+        self.assertEqual(match_credential("RO", SNMP_ITEMS, SNMPV2_RO_SUBTYPE), "snmp-uuid-1")
+
+    def test_snmp_never_matches_on_the_community_string(self) -> None:
+        with self.assertRaises(ConfigError):
+            match_credential("secret-community", SNMP_ITEMS, SNMPV2_RO_SUBTYPE)
+
+    def test_no_match_lists_available_without_secrets(self) -> None:
+        with self.assertRaises(ConfigError) as ctx:
+            match_credential("nope", CLI_ITEMS, CLI_SUBTYPE)
+        message = str(ctx.exception)
+        self.assertIn("CSS (cli-uuid-1)", message)
+        self.assertIn("Other (cli-uuid-2)", message)
+        self.assertNotIn("password", message.lower().replace("passwords", ""))
+        with self.assertRaisesRegex(ConfigError, "no SNMPv2 read-only credentials"):
+            match_credential("RO", [], SNMPV2_RO_SUBTYPE)
+
+    def test_ambiguous_description_is_rejected(self) -> None:
+        items = [{"id": "a", "description": "Dup"}, {"id": "b", "description": "dup"}]
+        with self.assertRaisesRegex(ConfigError, "ambiguous"):
+            match_credential("Dup", items, CLI_SUBTYPE)
+
+    def test_wrong_type_is_not_matched(self) -> None:
+        # 'RO' exists only as an SNMP credential, so it cannot be used as CLI.
+        with self.assertRaises(ConfigError):
+            match_credential("RO", CLI_ITEMS, CLI_SUBTYPE)
+
+
+class ResolveSettingsTests(unittest.TestCase):
+    def test_resolves_only_used_profiles_and_queries_each_type_once(self) -> None:
+        env = {**BASE_ENV, "CRED_DEFAULT_CLI_IDS": "CSS", "CRED_DEFAULT_SNMPV2_RO_IDS": "RO"}
+        calls: list[str] = []
+
+        def list_credentials(subtype: str):
+            calls.append(subtype)
+            return {"response": CLI_ITEMS if subtype == CLI_SUBTYPE else SNMP_ITEMS}
+
+        resolved = resolve_settings(load_settings(env), ["default"], list_credentials)
+        self.assertEqual(
+            resolved.profiles["default"].credential_ids, ["cli-uuid-1", "snmp-uuid-1"]
+        )
+        self.assertEqual(resolved.profiles["branch"].cli_ids, ("cli-2", "cli-3"))  # untouched
+        self.assertEqual(calls, [CLI_SUBTYPE, SNMPV2_RO_SUBTYPE])
+
+    def test_error_names_the_profile(self) -> None:
+        env = {**BASE_ENV, "CRED_DEFAULT_CLI_IDS": "missing"}
+        with self.assertRaisesRegex(ConfigError, "Profile 'default'.*missing"):
+            resolve_settings(load_settings(env), ["default"], lambda subtype: {"response": []})
+
+
+NCIM_FAILED_TASK = {
+    "response": {
+        "progress": "Inventory service initiate discovery has failed.",
+        "errorCode": "NCIM90257",
+        "failureReason": "Some of the selected global credentials are not available.",
+        "isError": True,
+        "startTime": 1,
+        "endTime": 2,
+        "id": "task-1",
+    },
+    "version": "1.0",
+}
+OK_TASK = {"response": {"progress": "1234", "isError": False, "endTime": 2, "id": "task-1"}}
+RUNNING_TASK = {"response": {"progress": "Starting", "isError": False, "id": "task-1"}}
+
+
+def discovery(condition: str, devices: int = 2):
+    return {
+        "response": {
+            "id": "1234",
+            "name": "discover-default",
+            "discoveryCondition": condition,
+            "numDevices": devices,
+            "password": "do-not-print",
+        }
+    }
+
+
+GOOD_JOBS = {
+    "response": [
+        {"ipAddress": "10.0.0.1", "pingStatus": "Success", "snmpStatus": "Success", "cliStatus": "Success"},
+        {"ipAddress": "10.0.0.2", "pingStatus": "Success", "snmpStatus": "Success", "cliStatus": "Success"},
+    ]
+}
+
+
+class FakeTime:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def sequence(*values):
+    items = list(values)
+    return lambda _id: items.pop(0) if len(items) > 1 else items[0]
+
+
+def verify(getters: ApiGetters, **kwargs):
+    fake = FakeTime()
+    report = verify_job("job", getters, sleep=fake.sleep, clock=fake.clock, **kwargs)
+    return report, fake
+
+
+class VerifyJobTests(unittest.TestCase):
+    def test_reports_the_ncim90257_failure_from_the_lab(self) -> None:
+        getters = ApiGetters(sequence(NCIM_FAILED_TASK), sequence(), sequence())
+        report, _ = verify(getters, task_id="task-1")
+        self.assertFalse(report.ok)
+        self.assertIn("NCIM90257", report.lines[0])
+        self.assertIn("global credentials are not available", report.lines[0])
+
+    def test_follows_task_then_discovery_to_per_ip_success(self) -> None:
+        getters = ApiGetters(
+            sequence(RUNNING_TASK, OK_TASK),
+            sequence(discovery("In Progress"), discovery("Complete")),
+            sequence(GOOD_JOBS),
+        )
+        report, fake = verify(getters, task_id="task-1")
+        self.assertTrue(report.ok, report.lines)
+        self.assertEqual(fake.sleeps, [5, 5])
+        self.assertIn("Task task-1 completed", report.lines[0])
+        self.assertIn('Discovery 1234 "discover-default": Complete, 2 device(s)', report.lines[1])
+        self.assertEqual(len(report.lines), 4)
+
+    def test_per_ip_failure_marks_the_job_as_a_problem(self) -> None:
+        jobs = {
+            "response": [
+                {"ipAddress": "10.0.0.1", "pingStatus": "Success", "snmpStatus": "Success", "cliStatus": "Success"},
+                {
+                    "ipAddress": "10.0.0.2",
+                    "pingStatus": "Success",
+                    "snmpStatus": "Success",
+                    "cliStatus": "Failed",
+                    "errorDescription": "CLI login failed",
+                },
+            ]
+        }
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(jobs))
+        report, _ = verify(getters, task_id="task-1")
+        self.assertFalse(report.ok)
+        text = "\n".join(report.lines)
+        self.assertIn("ATTENTION  ping=Success snmp=Success cli=Failed: CLI login failed", text)
+
+    def test_times_out_while_the_task_is_running(self) -> None:
+        getters = ApiGetters(sequence(RUNNING_TASK), sequence(), sequence())
+        report, fake = verify(getters, task_id="task-1", timeout=12)
+        self.assertFalse(report.ok)
+        self.assertIn("still running after 12s", report.lines[0])
+        self.assertIn("check_discovery.py task-1", report.lines[0])
+        self.assertEqual(fake.sleeps, [5, 5, 2])
+
+    def test_times_out_while_the_discovery_is_running(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("In Progress")), sequence())
+        report, _ = verify(getters, task_id="task-1", timeout=10)
+        self.assertFalse(report.ok)
+        self.assertIn("--discovery-id 1234", report.lines[-1])
+
+    def test_task_without_discovery_id_cannot_be_verified(self) -> None:
+        task = {"response": {"progress": "", "isError": False, "endTime": 2}}
+        report, _ = verify(ApiGetters(sequence(task), sequence(), sequence()), task_id="t")
+        self.assertFalse(report.ok)
+        self.assertIn("no discovery ID", report.lines[0])
+
+    def test_discovery_id_skips_the_task_step(self) -> None:
+        getters = ApiGetters(sequence(), sequence(discovery("Complete")), sequence(GOOD_JOBS))
+        report, _ = verify(getters, discovery_id="1234")
+        self.assertTrue(report.ok, report.lines)
+        self.assertNotIn("Task", report.lines[0])
+
+    def test_api_errors_become_a_report_not_a_crash(self) -> None:
+        def boom(_id):
+            raise RuntimeError("network down")
+
+        report, _ = verify(ApiGetters(boom, boom, boom), task_id="t")
+        self.assertFalse(report.ok)
+        self.assertIn("RuntimeError: network down", report.lines[0])
+
+    def test_needs_a_task_or_discovery_id(self) -> None:
+        report, _ = verify(ApiGetters(sequence(), sequence(), sequence()))
+        self.assertFalse(report.ok)
+        self.assertIn("required", report.lines[0])
+
+    def test_no_per_ip_results_is_not_a_success(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete", 0)), sequence({"response": []}))
+        report, _ = verify(getters, task_id="t")
+        self.assertFalse(report.ok)
+
+
+class ReportingTests(unittest.TestCase):
+    def test_redacts_secrets_in_raw_output_and_sets_exit_code(self) -> None:
+        report = JobReport("p", True, ["fine"], {"discovery": discovery("Complete")})
+        bad = JobReport("q", False, ["broken"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code_ok = print_reports([report], raw=True)
+            code_bad = print_reports([report, bad])
+        self.assertEqual((code_ok, code_bad), (0, 1))
+        self.assertIn('"password": "***"', out.getvalue())
+        self.assertNotIn("do-not-print", out.getvalue())
+        self.assertIn("[q] PROBLEM", out.getvalue())
+
+    def test_verify_submitted_handles_a_missing_task_id(self) -> None:
+        reports = verify_submitted([("p", {"response": {}})], ApiGetters(sequence(), sequence(), sequence()))
+        self.assertFalse(reports[0].ok)
+        self.assertIn("no task ID", reports[0].lines[0])
+
+    def test_task_id_extraction(self) -> None:
+        self.assertEqual(task_id_from_response({"response": {"taskId": "abc"}}), "abc")
+        self.assertIsNone(task_id_from_response({"response": {}}))
+        self.assertIsNone(task_id_from_response("garbage"))
 
 
 if __name__ == "__main__":

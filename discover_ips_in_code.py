@@ -23,8 +23,9 @@
 
 Edit DEVICES, make sure .env is filled in, then run:
 
-    python discover_ips_in_code.py            # submit the discovery jobs
+    python discover_ips_in_code.py            # submit, then wait and report the results
     python discover_ips_in_code.py --dry-run  # only show what would be sent
+    python discover_ips_in_code.py --no-wait  # submit only (check later with check_discovery.py)
 """
 
 from __future__ import annotations
@@ -40,13 +41,19 @@ from catalystcentersdk.exceptions import catalystcentersdkException
 from discovery_common import (
     REQUEST_TIMEOUT_SECONDS,
     SDK_API_VERSION,
+    ApiGetters,
     ConfigError,
     JobSubmissionError,
+    add_wait_arguments,
     apply_tls_policy,
     build_jobs,
     group_by_profile,
     load_settings,
+    print_reports,
+    resolve_settings,
     run_jobs,
+    task_id_from_response,
+    verify_submitted,
 )
 
 # ---------------------------------------------------------------------------
@@ -67,15 +74,20 @@ def main() -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="print the payloads without calling the API"
     )
+    add_wait_arguments(parser)
     args = parser.parse_args()
 
     try:
         settings = load_settings()
         groups = group_by_profile(DEVICES, settings)
-        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX)
 
         if args.dry_run:
-            for _profile, payload in jobs:
+            print(
+                "# Dry run: credential values are shown as written in .env "
+                "(not looked up yet).",
+                file=sys.stderr,
+            )
+            for _profile, payload in build_jobs(groups, settings, JOB_NAME_PREFIX):
                 print(json.dumps(payload, indent=2))
             return 0
 
@@ -92,6 +104,15 @@ def main() -> int:
             single_request_timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
+        # .env may hold credential descriptions (like "CSS") or IDs. Look them up
+        # (GET /dna/intent/api/v1/global-credential) and stop early if one is missing.
+        settings = resolve_settings(
+            settings,
+            groups,
+            lambda subtype: api.discovery.get_global_credentials(subtype),
+        )
+        jobs = build_jobs(groups, settings, JOB_NAME_PREFIX)
+
         # POST /dna/intent/api/v1/discovery, once per credential profile.
         results = run_jobs(
             jobs,
@@ -99,6 +120,30 @@ def main() -> int:
                 payload=payload, active_validation=False
             ),
         )
+        for profile, response in results:
+            print(
+                "{}: submitted, task {}".format(
+                    profile, task_id_from_response(response) or "?"
+                )
+            )
+        if args.no_wait:
+            print(
+                "Not waiting for results (--no-wait). "
+                "Check later with: python check_discovery.py <task-id>"
+            )
+            return 0
+
+        # Discovery is asynchronous: follow each task, then the discovery itself.
+        getters = ApiGetters(
+            get_task=lambda task_id: api.task.get_task_by_id(task_id),
+            get_discovery=lambda discovery_id: api.discovery.get_discovery_by_id(
+                discovery_id
+            ),
+            get_jobs=lambda discovery_id: (
+                api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
+            ),
+        )
+        reports = verify_submitted(results, getters, args.timeout)
     except (
         ConfigError,
         JobSubmissionError,
@@ -109,9 +154,7 @@ def main() -> int:
         print("Error: {}".format(exc), file=sys.stderr)
         return 1
 
-    for profile, response in results:
-        print("{}: {}".format(profile, json.dumps(response)))
-    return 0
+    return print_reports(reports, args.raw)
 
 
 if __name__ == "__main__":

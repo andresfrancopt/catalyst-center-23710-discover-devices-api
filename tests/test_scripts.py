@@ -28,11 +28,22 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import check_discovery
 import discover_from_csv
 import discover_ips_in_code
 import reference_discover_without_sdk
 from discovery_common import ConfigError, SDK_API_VERSION
-from test_discovery_common import BASE_ENV
+from test_discovery_common import BASE_ENV, GOOD_JOBS, NCIM_FAILED_TASK, OK_TASK, discovery
+
+CLI_CREDS = {
+    "response": [
+        {"id": "cli-1", "description": "CSS"},
+        {"id": "cli-2", "description": "B1"},
+        {"id": "cli-3", "description": "B2"},
+    ]
+}
+SNMP_CREDS = {"response": [{"id": "snmp-1", "description": "RO"}, {"id": "snmp-2", "description": "RO2"}]}
+DEVICES = [("10.48.90.173", "default"), ("10.48.90.174", None), ("10.48.91.10", "branch")]
 
 
 def run_main(module, argv):
@@ -40,6 +51,30 @@ def run_main(module, argv):
     with patch("sys.argv", ["prog", *argv]), redirect_stdout(out), redirect_stderr(err):
         code = module.main()
     return code, out.getvalue(), err.getvalue()
+
+
+def configure(api, task=OK_TASK) -> None:
+    """Make a mocked SDK client behave like a healthy controller."""
+    api.discovery.get_global_credentials.side_effect = lambda subtype: (
+        CLI_CREDS if subtype == "CLI" else SNMP_CREDS
+    )
+    api.discovery.start_discovery.return_value = {"response": {"taskId": "t1", "url": "/x"}}
+    api.task.get_task_by_id.return_value = task
+    api.discovery.get_discovery_by_id.return_value = discovery("Complete")
+    api.discovery.get_list_of_discoveries_by_discovery_id.return_value = GOOD_JOBS
+
+
+class EnvironmentCase(unittest.TestCase):
+    env = BASE_ENV
+
+    def setUp(self) -> None:
+        for p in (
+            patch("discovery_common.load_dotenv"),
+            patch.dict("os.environ", self.env, clear=True),
+            patch("discovery_common.Path.is_file", return_value=True),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
 
 
 class CsvReaderTests(unittest.TestCase):
@@ -73,40 +108,24 @@ class CsvReaderTests(unittest.TestCase):
             discover_from_csv.read_devices(self.write("ip_address\n"))
 
 
-class SdkScriptTests(unittest.TestCase):
+class InCodeScriptTests(EnvironmentCase):
     def setUp(self) -> None:
-        patcher = patch("discovery_common.load_dotenv")
+        super().setUp()
+        patcher = patch.object(discover_ips_in_code, "DEVICES", DEVICES)
         patcher.start()
         self.addCleanup(patcher.stop)
-        env_patch = patch.dict("os.environ", BASE_ENV, clear=True)
-        env_patch.start()
-        self.addCleanup(env_patch.stop)
-        file_patch = patch("discovery_common.Path.is_file", return_value=True)
-        file_patch.start()
-        self.addCleanup(file_patch.stop)
-        devices_patch = patch.object(
-            discover_ips_in_code,
-            "DEVICES",
-            [("10.48.90.173", "default"), ("10.48.90.174", None), ("10.48.91.10", "branch")],
-        )
-        devices_patch.start()
-        self.addCleanup(devices_patch.stop)
 
-    def test_verify_ssl_false_reaches_the_sdk_with_a_warning(self) -> None:
-        with patch.dict("os.environ", {"CATALYST_CENTER_VERIFY_SSL": "false"}):
+    def run_script(self, argv=(), env=None):
+        with patch.dict("os.environ", env or {}):
             with patch.object(discover_ips_in_code, "CatalystCenterAPI") as sdk:
-                sdk.return_value.discovery.start_discovery.return_value = {"taskId": "t"}
-                code, _, err = run_main(discover_ips_in_code, [])
-        self.assertEqual(code, 0)
-        self.assertIs(sdk.call_args.kwargs["verify"], False)
-        self.assertIn("certificate verification is DISABLED", err)
+                configure(sdk.return_value)
+                result = run_main(discover_ips_in_code, list(argv))
+        return sdk, result
 
-    def test_in_code_script_uses_sdk_once_per_profile(self) -> None:
-        with patch.object(discover_ips_in_code, "CatalystCenterAPI") as sdk:
-            sdk.return_value.discovery.start_discovery.return_value = {"taskId": "t"}
-            code, out, err = run_main(discover_ips_in_code, [])
+    def test_submits_once_per_profile_then_verifies_each_job(self) -> None:
+        sdk, (code, out, err) = self.run_script()
 
-        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(code, 0, out + err)
         sdk.assert_called_once_with(
             username="api-user",
             password="  s3cret  ",
@@ -115,29 +134,56 @@ class SdkScriptTests(unittest.TestCase):
             verify=True,
             single_request_timeout=30,
         )
-        calls = sdk.return_value.discovery.start_discovery.call_args_list
+        api = sdk.return_value
+        calls = api.discovery.start_discovery.call_args_list
         payloads = [c.kwargs["payload"] for c in calls]
         self.assertEqual([p["name"] for p in payloads], ["discover-default", "discover-branch"])
         self.assertTrue(all(c.kwargs["active_validation"] is False for c in calls))
         self.assertEqual(payloads[0]["ipAddressList"], "10.48.90.173,10.48.90.174")
+        self.assertEqual(payloads[0]["globalCredentialIdList"], ["cli-1", "snmp-1"])
         self.assertEqual(payloads[1]["globalCredentialIdList"], ["cli-2", "cli-3", "snmp-2"])
+        self.assertEqual(api.task.get_task_by_id.call_count, 2)
+        self.assertIn("default: submitted, task t1", out)
+        self.assertIn("[default] OK", out)
+        self.assertIn("[branch] OK", out)
 
-    def test_csv_script_groups_rows_and_reports_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            csv_path = Path(tmp) / "d.csv"
-            csv_path.write_text(
-                "ip_address,credential_profile\n10.0.0.1,branch\n10.0.0.2,\n", encoding="utf-8"
-            )
-            with patch.object(discover_from_csv, "CatalystCenterAPI") as sdk:
-                start = sdk.return_value.discovery.start_discovery
-                start.side_effect = [{"taskId": "1"}, RuntimeError("boom")]
-                code, out, err = run_main(discover_from_csv, [str(csv_path), "--name-prefix", "x"])
+    def test_descriptions_in_env_are_resolved_to_credential_ids(self) -> None:
+        sdk, (code, out, err) = self.run_script(
+            env={"CRED_DEFAULT_CLI_IDS": "css", "CRED_DEFAULT_SNMPV2_RO_IDS": "RO"}
+        )
+        self.assertEqual(code, 0, out + err)
+        first = sdk.return_value.discovery.start_discovery.call_args_list[0]
+        self.assertEqual(first.kwargs["payload"]["globalCredentialIdList"], ["cli-1", "snmp-1"])
 
+    def test_unknown_credential_stops_before_anything_is_submitted(self) -> None:
+        sdk, (code, out, err) = self.run_script(env={"CRED_DEFAULT_CLI_IDS": "CSS-typo"})
         self.assertEqual(code, 1)
-        self.assertIn("boom", err)
-        self.assertIn("Already submitted: branch", err)
-        names = [c.kwargs["payload"]["name"] for c in start.call_args_list]
-        self.assertEqual(names, ["x-branch", "x-default"])
+        self.assertIn("Profile 'default'", err)
+        self.assertIn("CSS (cli-1)", err)
+        sdk.return_value.discovery.start_discovery.assert_not_called()
+
+    def test_failed_task_is_reported_with_a_nonzero_exit_code(self) -> None:
+        with patch.object(discover_ips_in_code, "CatalystCenterAPI") as sdk:
+            configure(sdk.return_value, task=NCIM_FAILED_TASK)
+            code, out, _ = run_main(discover_ips_in_code, [])
+        self.assertEqual(code, 1)
+        self.assertIn("[default] PROBLEM", out)
+        self.assertIn("NCIM90257", out)
+
+    def test_no_wait_submits_without_any_verification(self) -> None:
+        sdk, (code, out, _) = self.run_script(["--no-wait"])
+        self.assertEqual(code, 0)
+        api = sdk.return_value
+        self.assertEqual(api.discovery.start_discovery.call_count, 2)
+        api.task.get_task_by_id.assert_not_called()
+        self.assertIn("check_discovery.py", out)
+
+    def test_raw_prints_redacted_responses(self) -> None:
+        _, (code, out, _) = self.run_script(["--raw"])
+        self.assertEqual(code, 0)
+        self.assertIn('"discoveryCondition": "Complete"', out)
+        self.assertIn('"password": "***"', out)
+        self.assertNotIn("do-not-print", out)
 
     def test_dry_run_never_touches_the_api(self) -> None:
         with patch.object(discover_ips_in_code, "CatalystCenterAPI") as sdk:
@@ -146,47 +192,151 @@ class SdkScriptTests(unittest.TestCase):
         sdk.assert_not_called()
         self.assertIn('"name": "discover-branch"', out)
 
+    def test_verify_ssl_false_reaches_the_sdk_with_a_warning(self) -> None:
+        sdk, (code, _, err) = self.run_script(env={"CATALYST_CENTER_VERIFY_SSL": "false"})
+        self.assertEqual(code, 0)
+        self.assertIs(sdk.call_args.kwargs["verify"], False)
+        self.assertIn("certificate verification is DISABLED", err)
+
     def test_configuration_error_is_reported(self) -> None:
-        with patch.dict("os.environ", {"CATALYST_CENTER_USERNAME": ""}):
-            code, _, err = run_main(discover_ips_in_code, [])
+        _, (code, _, err) = self.run_script(env={"CATALYST_CENTER_USERNAME": ""})
         self.assertEqual(code, 1)
         self.assertIn("CATALYST_CENTER_USERNAME", err)
 
 
-class ReferenceScriptTests(unittest.TestCase):
-    def test_authenticates_then_posts_each_profile(self) -> None:
-        patches = [
-            patch("discovery_common.load_dotenv"),
-            patch.dict("os.environ", BASE_ENV, clear=True),
-            patch("discovery_common.Path.is_file", return_value=True),
+class CsvScriptTests(EnvironmentCase):
+    def run_csv(self, rows: str, argv=(), configure_api=configure):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "d.csv"
+            csv_path.write_text(rows, encoding="utf-8")
+            with patch.object(discover_from_csv, "CatalystCenterAPI") as sdk:
+                configure_api(sdk.return_value)
+                result = run_main(discover_from_csv, [str(csv_path), *argv])
+        return sdk, result
+
+    def test_groups_rows_by_profile_and_verifies(self) -> None:
+        sdk, (code, out, err) = self.run_csv(
+            "ip_address,credential_profile\n10.0.0.1,branch\n10.0.0.2,\n",
+            ["--name-prefix", "x"],
+        )
+        self.assertEqual(code, 0, out + err)
+        names = [
+            c.kwargs["payload"]["name"]
+            for c in sdk.return_value.discovery.start_discovery.call_args_list
         ]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
+        self.assertEqual(names, ["x-branch", "x-default"])
+        self.assertIn("[branch] OK", out)
+
+    def test_submission_failure_lists_what_was_already_submitted(self) -> None:
+        def broken(api):
+            configure(api)
+            api.discovery.start_discovery.side_effect = [
+                {"response": {"taskId": "1"}},
+                RuntimeError("boom"),
+            ]
+
+        sdk, (code, _, err) = self.run_csv(
+            "ip_address,credential_profile\n10.0.0.1,branch\n10.0.0.2,\n", configure_api=broken
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("boom", err)
+        self.assertIn("Already submitted: branch", err)
+
+    def test_no_wait(self) -> None:
+        sdk, (code, out, _) = self.run_csv("ip_address\n10.0.0.1\n", ["--no-wait"])
+        self.assertEqual(code, 0)
+        sdk.return_value.task.get_task_by_id.assert_not_called()
+        self.assertIn("default: submitted, task t1", out)
+
+
+class CheckDiscoveryScriptTests(EnvironmentCase):
+    # The check script only needs the API login, not credential profiles.
+    env = {k: v for k, v in BASE_ENV.items() if not k.startswith("CRED")}
+
+    def run_check(self, argv, task=OK_TASK):
+        with patch.object(check_discovery, "CatalystCenterAPI") as sdk:
+            configure(sdk.return_value, task=task)
+            result = run_main(check_discovery, argv)
+        return sdk, result
+
+    def test_checks_a_task_id(self) -> None:
+        sdk, (code, out, err) = self.run_check(["t1"])
+        self.assertEqual(code, 0, out + err)
+        sdk.return_value.task.get_task_by_id.assert_called_once_with("t1")
+        self.assertIn("[task t1] OK", out)
+
+    def test_checks_a_discovery_id_directly(self) -> None:
+        sdk, (code, out, _) = self.run_check(["--discovery-id", "1234"])
+        self.assertEqual(code, 0)
+        sdk.return_value.task.get_task_by_id.assert_not_called()
+        sdk.return_value.discovery.get_discovery_by_id.assert_called_once_with("1234")
+        self.assertIn("[discovery 1234] OK", out)
+
+    def test_failed_task_gives_a_nonzero_exit_code(self) -> None:
+        _, (code, out, _) = self.run_check(["t1"], task=NCIM_FAILED_TASK)
+        self.assertEqual(code, 1)
+        self.assertIn("NCIM90257", out)
+
+    def test_needs_exactly_one_identifier(self) -> None:
+        for argv in ([], ["t1", "--discovery-id", "1"]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_check(argv)
+                self.assertEqual(ctx.exception.code, 2)
+
+
+class ReferenceScriptTests(EnvironmentCase):
+    def test_does_the_same_without_the_sdk(self) -> None:
+        base = "https://catalyst.example.test"
+        seen: list[tuple[str, str]] = []
+
+        def fake_request(method, url, **kwargs):
+            path = url.removeprefix(base)
+            seen.append((method, path))
+            self.assertEqual(kwargs["headers"], {"X-Auth-Token": "tok"})
+            self.assertIs(kwargs["verify"], True)
+            response = MagicMock()
+            if path == "/dna/intent/api/v1/global-credential":
+                kind = kwargs["params"]["credentialSubType"]
+                response.json.return_value = CLI_CREDS if kind == "CLI" else SNMP_CREDS
+            elif method == "POST" and path == "/dna/intent/api/v1/discovery":
+                response.json.return_value = {"response": {"taskId": "t1"}}
+            elif path.startswith("/dna/intent/api/v1/task/"):
+                response.json.return_value = OK_TASK
+            elif path.endswith("/job"):
+                response.json.return_value = GOOD_JOBS
+            else:
+                response.json.return_value = discovery("Complete")
+            return response
 
         token_response = MagicMock()
         token_response.json.return_value = {"Token": "tok"}
-        job_response = MagicMock()
-        job_response.json.return_value = {"taskId": "t"}
-        with patch.object(
-            reference_discover_without_sdk.requests,
-            "post",
-            side_effect=[token_response, job_response, job_response],
-        ) as post:
-            code, out, err = run_main(reference_discover_without_sdk, [])
+        with patch.object(reference_discover_without_sdk, "DEVICES", DEVICES):
+            with patch.object(
+                reference_discover_without_sdk.requests, "post", return_value=token_response
+            ) as post:
+                with patch.object(
+                    reference_discover_without_sdk.requests, "request", side_effect=fake_request
+                ):
+                    code, out, err = run_main(reference_discover_without_sdk, [])
 
-        self.assertEqual((code, err), (0, ""))
-        auth_call, first_job, _second_job = post.call_args_list
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(post.call_args.args[0], base + "/dna/system/api/v1/auth/token")
+        self.assertEqual(post.call_args.kwargs["auth"], ("api-user", "  s3cret  "))
         self.assertEqual(
-            auth_call.args[0], "https://catalyst.example.test/dna/system/api/v1/auth/token"
+            [item for item in seen if item[0] == "POST"],
+            [("POST", "/dna/intent/api/v1/discovery")] * 2,
         )
-        self.assertEqual(auth_call.kwargs["auth"], ("api-user", "  s3cret  "))
-        self.assertEqual(
-            first_job.args[0], "https://catalyst.example.test/dna/intent/api/v1/discovery"
-        )
-        self.assertEqual(first_job.kwargs["headers"], {"X-Auth-Token": "tok"})
-        self.assertEqual(first_job.kwargs["json"]["name"], "discover-default")
-        self.assertIs(first_job.kwargs["verify"], True)
+        self.assertIn(("GET", "/dna/intent/api/v1/task/t1"), seen)
+        self.assertIn("[default] OK", out)
+        self.assertIn("[branch] OK", out)
+
+    def test_dry_run_makes_no_requests(self) -> None:
+        with patch.object(reference_discover_without_sdk.requests, "post") as post:
+            code, out, _ = run_main(reference_discover_without_sdk, ["--dry-run"])
+        self.assertEqual(code, 0)
+        post.assert_not_called()
+        self.assertIn('"name": "discover-default"', out)
 
 
 if __name__ == "__main__":

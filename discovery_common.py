@@ -28,11 +28,13 @@ non-SDK reference script can reuse it.
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import sys
+import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -122,13 +124,45 @@ def _split_ids(raw: str) -> tuple[str, ...]:
     return tuple(ids)
 
 
+def _load_profiles(get: Callable[[str], str]) -> dict[str, CredentialProfile]:
+    profiles: dict[str, CredentialProfile] = {}
+    for raw_name in get("CREDENTIAL_PROFILES").split(","):
+        name = raw_name.strip()
+        if not name:
+            continue
+        if not _PROFILE_NAME.match(name):
+            raise ConfigError(
+                "Invalid profile name {!r}: use letters, digits and underscores".format(
+                    name
+                )
+            )
+        key = name.lower()
+        if key in profiles:
+            raise ConfigError("Profile {!r} is listed more than once".format(name))
+        prefix = "CRED_{}_".format(name.upper())
+        cli_ids = _split_ids(get(prefix + "CLI_IDS"))
+        snmp_ids = _split_ids(get(prefix + "SNMPV2_RO_IDS"))
+        if not cli_ids or not snmp_ids:
+            raise ConfigError(
+                "Profile {!r} needs at least one value in both {}CLI_IDS and "
+                "{}SNMPV2_RO_IDS".format(name, prefix, prefix)
+            )
+        profiles[key] = CredentialProfile(key, cli_ids, snmp_ids)
+
+    if not profiles:
+        raise ConfigError("CREDENTIAL_PROFILES does not list any profile")
+    return profiles
+
+
 def load_settings(
     environ: Mapping[str, str] | None = None,
     dotenv_path: Path | str = DEFAULT_ENV_PATH,
+    require_profiles: bool = True,
 ) -> Settings:
     """Read settings from the environment, loading the .env file first.
 
     Variables already present in the real environment win over .env values.
+    Scripts that only talk to the API (not submit jobs) can skip the profiles.
     """
     if environ is None:
         if not Path(dotenv_path).is_file():
@@ -149,7 +183,7 @@ def load_settings(
             "CATALYST_CENTER_BASE_URL",
             "CATALYST_CENTER_USERNAME",
             "CATALYST_CENTER_PASSWORD",
-            "CREDENTIAL_PROFILES",
+            *(("CREDENTIAL_PROFILES",) if require_profiles else ()),
         )
         if not environ.get(name, "").strip()
     ]
@@ -176,32 +210,7 @@ def load_settings(
             "CATALYST_CENTER_VERIFY_SSL=false, not both"
         )
 
-    profiles: dict[str, CredentialProfile] = {}
-    for raw_name in get("CREDENTIAL_PROFILES").split(","):
-        name = raw_name.strip()
-        if not name:
-            continue
-        if not _PROFILE_NAME.match(name):
-            raise ConfigError(
-                "Invalid profile name {!r}: use letters, digits and underscores".format(
-                    name
-                )
-            )
-        key = name.lower()
-        if key in profiles:
-            raise ConfigError("Profile {!r} is listed more than once".format(name))
-        prefix = "CRED_{}_".format(name.upper())
-        cli_ids = _split_ids(get(prefix + "CLI_IDS"))
-        snmp_ids = _split_ids(get(prefix + "SNMPV2_RO_IDS"))
-        if not cli_ids or not snmp_ids:
-            raise ConfigError(
-                "Profile {!r} needs at least one ID in both {}CLI_IDS and "
-                "{}SNMPV2_RO_IDS".format(name, prefix, prefix)
-            )
-        profiles[key] = CredentialProfile(key, cli_ids, snmp_ids)
-
-    if not profiles:
-        raise ConfigError("CREDENTIAL_PROFILES does not list any profile")
+    profiles = _load_profiles(get) if require_profiles else {}
 
     return Settings(
         base_url=base_url,
@@ -209,7 +218,7 @@ def load_settings(
         password=environ["CATALYST_CENTER_PASSWORD"],
         ca_bundle=ca_bundle,
         profiles=profiles,
-        default_profile=next(iter(profiles)),
+        default_profile=next(iter(profiles), ""),
         verify_ssl=verify_ssl,
     )
 
@@ -297,3 +306,363 @@ def run_jobs(
                 "Already submitted: {}.".format(profile, type(exc).__name__, exc, done)
             ) from exc
     return results
+
+
+# ---------------------------------------------------------------------------
+# Credential lookup: .env values may be a credential ID or its description.
+# ---------------------------------------------------------------------------
+
+CLI_SUBTYPE = "CLI"
+SNMPV2_RO_SUBTYPE = "SNMPV2_READ_COMMUNITY"
+_KIND_LABEL = {CLI_SUBTYPE: "CLI", SNMPV2_RO_SUBTYPE: "SNMPv2 read-only"}
+_MAX_LISTED = 25
+
+
+def response_items(response: Any) -> list[Mapping[str, Any]]:
+    """Return the list stored under a Catalyst Center response's 'response' key."""
+    body = response.get("response") if isinstance(response, Mapping) else None
+    if isinstance(body, list):
+        return [item for item in body if isinstance(item, Mapping)]
+    return []
+
+
+def _credential_id(item: Mapping[str, Any]) -> str:
+    return str(item.get("id") or item.get("instanceUuid") or "").strip()
+
+
+def _describe(item: Mapping[str, Any]) -> str:
+    # Only identifying fields are ever shown; secret fields are never printed.
+    name = item.get("description") or item.get("username") or "(no description)"
+    return "{} ({})".format(name, _credential_id(item) or "no id")
+
+
+def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) -> str:
+    """Resolve an ID or description (CLI: also username) to a credential ID."""
+    wanted = ref.strip()
+    label = _KIND_LABEL.get(kind, kind)
+
+    def by_id(item: Mapping[str, Any]) -> bool:
+        return wanted in (item.get("id"), item.get("instanceUuid"))
+
+    def by_text(name: str) -> Callable[[Mapping[str, Any]], bool]:
+        return lambda item: str(item.get(name) or "").strip().lower() == wanted.lower()
+
+    stages = [("ID", by_id), ("description", by_text("description"))]
+    if kind == CLI_SUBTYPE:
+        stages.append(("username", by_text("username")))
+
+    for stage, test in stages:
+        found = [item for item in items if test(item)]
+        if len(found) > 1:
+            raise ConfigError(
+                "{} credential {!r} is ambiguous ({} credentials share that {}): {}. "
+                "Use the credential ID instead.".format(
+                    label, ref, len(found), stage, ", ".join(_describe(i) for i in found)
+                )
+            )
+        if found:
+            credential_id = _credential_id(found[0])
+            if not credential_id:
+                raise ConfigError(
+                    "{} credential {!r} was found but has no ID".format(label, ref)
+                )
+            return credential_id
+
+    if items:
+        shown = ", ".join(_describe(i) for i in items[:_MAX_LISTED])
+        more = len(items) - _MAX_LISTED
+        available = "Available: {}{}".format(shown, " and {} more".format(more) if more > 0 else "")
+    else:
+        available = "The controller has no {} credentials.".format(label)
+    raise ConfigError(
+        "No {} credential matches {!r}. Use a credential ID or description. {}".format(
+            label, ref, available
+        )
+    )
+
+
+def resolve_settings(
+    settings: Settings,
+    profile_names: Iterable[str],
+    list_credentials: Callable[[str], Any],
+) -> Settings:
+    """Replace names/descriptions in the used profiles with real credential IDs.
+
+    list_credentials(subtype) must return the controller's
+    GET /dna/intent/api/v1/global-credential response for that subtype.
+    """
+    cache: dict[str, list[Mapping[str, Any]]] = {}
+
+    def items(subtype: str) -> list[Mapping[str, Any]]:
+        if subtype not in cache:
+            cache[subtype] = response_items(list_credentials(subtype))
+        return cache[subtype]
+
+    resolved = dict(settings.profiles)
+    for name in profile_names:
+        profile = settings.profiles[name]
+        try:
+            cli = tuple(
+                dict.fromkeys(
+                    match_credential(ref, items(CLI_SUBTYPE), CLI_SUBTYPE)
+                    for ref in profile.cli_ids
+                )
+            )
+            snmp = tuple(
+                dict.fromkeys(
+                    match_credential(ref, items(SNMPV2_RO_SUBTYPE), SNMPV2_RO_SUBTYPE)
+                    for ref in profile.snmpv2_ro_ids
+                )
+            )
+        except ConfigError as exc:
+            raise ConfigError("Profile {!r}: {}".format(name, exc)) from exc
+        resolved[name] = CredentialProfile(name, cli, snmp)
+    return replace(settings, profiles=resolved)
+
+
+# ---------------------------------------------------------------------------
+# Verification: discovery is asynchronous, so follow the task and the discovery.
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL_SECONDS = 5
+DEFAULT_WAIT_TIMEOUT_SECONDS = 300
+_RUNNING_CONDITIONS = {"in progress", "inprogress", "in-progress", "queued", "pending", "starting", "running"}
+_SENSITIVE_KEY_PARTS = ("password", "passphrase", "community", "secret", "token")
+
+
+@dataclass(frozen=True)
+class ApiGetters:
+    """The three read calls verification needs; SDK and requests both provide them."""
+
+    get_task: Callable[[str], Any]
+    get_discovery: Callable[[str], Any]
+    get_jobs: Callable[[str], Any]
+
+
+@dataclass
+class JobReport:
+    label: str
+    ok: bool
+    lines: list[str] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+def add_wait_arguments(parser: Any) -> None:
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="submit only; do not wait for or check the discovery result",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_WAIT_TIMEOUT_SECONDS,
+        help="seconds to wait per job for results (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="also print the controller's raw task/discovery responses (secrets redacted)",
+    )
+
+
+def redact(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: "***"
+            if any(part in str(key).lower() for part in _SENSITIVE_KEY_PARTS)
+            else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    return value
+
+
+def task_id_from_response(response: Any) -> str | None:
+    body = response.get("response") if isinstance(response, Mapping) else None
+    task_id = body.get("taskId") if isinstance(body, Mapping) else None
+    return str(task_id) if task_id else None
+
+
+def _body(response: Any) -> Mapping[str, Any]:
+    body = response.get("response") if isinstance(response, Mapping) else None
+    return body if isinstance(body, Mapping) else {}
+
+
+def _task_done(response: Any) -> bool:
+    body = _body(response)
+    return bool(body.get("isError")) or bool(body.get("endTime"))
+
+
+def _discovery_running(response: Any) -> bool:
+    condition = str(_body(response).get("discoveryCondition") or "").strip().lower()
+    return condition in _RUNNING_CONDITIONS
+
+
+def _poll(
+    fetch: Callable[[], Any],
+    done: Callable[[Any], bool],
+    deadline: float,
+    interval: float,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> tuple[Any, bool]:
+    while True:
+        value = fetch()
+        if done(value):
+            return value, True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return value, False
+        sleep(min(interval, remaining))
+
+
+def summarize_jobs(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
+    """One line per IP; ok only when ping, SNMP and CLI all succeeded."""
+    if not jobs:
+        return ["- no per-IP results were returned"], False
+
+    lines: list[str] = []
+    all_ok = True
+    for job in jobs:
+        statuses = {
+            key: str(job.get(field_name) or "-")
+            for key, field_name in (("ping", "pingStatus"), ("snmp", "snmpStatus"), ("cli", "cliStatus"))
+        }
+        ok = all(value.strip().lower() == "success" for value in statuses.values())
+        all_ok = all_ok and ok
+        detail = next(
+            (
+                str(job[name])
+                for name in ("errorDescription", "errDescription", "errorCode")
+                if job.get(name)
+            ),
+            "",
+        )
+        lines.append(
+            "- {ip:<15} {state}  ping={ping} snmp={snmp} cli={cli}{detail}".format(
+                ip=str(job.get("ipAddress") or "?"),
+                state="OK       " if ok else "ATTENTION",
+                detail=": " + detail if detail else "",
+                **statuses,
+            )
+        )
+    return lines, all_ok
+
+
+def verify_job(
+    label: str,
+    getters: ApiGetters,
+    *,
+    task_id: str | None = None,
+    discovery_id: str | None = None,
+    timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    interval: float = POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> JobReport:
+    """Follow a job: task result, then discovery completion, then per-IP results."""
+    report = JobReport(label, False)
+    deadline = clock() + timeout
+    try:
+        if discovery_id is None:
+            if not task_id:
+                raise ValueError("a task ID or a discovery ID is required")
+            task, finished = _poll(
+                lambda: getters.get_task(task_id), _task_done, deadline, interval, sleep, clock
+            )
+            report.raw["task"] = task
+            body = _body(task)
+            if not finished:
+                report.lines.append(
+                    "Task {} is still running after {}s. Check later with: "
+                    "python check_discovery.py {}".format(task_id, int(timeout), task_id)
+                )
+                return report
+            if body.get("isError"):
+                reason = body.get("failureReason") or body.get("progress") or "no reason given"
+                code = body.get("errorCode")
+                report.lines.append(
+                    "Task {} failed: {}{}".format(
+                        task_id, "[{}] ".format(code) if code else "", reason
+                    )
+                )
+                return report
+            discovery_id = str(body.get("progress") or "").strip() or None
+            if not discovery_id:
+                report.lines.append(
+                    "Task {} completed but its result has no discovery ID, so the devices "
+                    "cannot be checked (use --raw to inspect the response).".format(task_id)
+                )
+                return report
+            report.lines.append("Task {} completed".format(task_id))
+
+        discovery, finished = _poll(
+            lambda: getters.get_discovery(discovery_id),
+            lambda response: not _discovery_running(response),
+            deadline,
+            interval,
+            sleep,
+            clock,
+        )
+        report.raw["discovery"] = discovery
+        info = _body(discovery)
+        header = 'Discovery {} "{}": {}, {} device(s)'.format(
+            discovery_id,
+            info.get("name") or "?",
+            info.get("discoveryCondition") or "unknown state",
+            info.get("numDevices") if info.get("numDevices") is not None else "?",
+        )
+        if not finished:
+            report.lines.append(
+                header + ". Still running after {}s; check later with: "
+                "python check_discovery.py --discovery-id {}".format(int(timeout), discovery_id)
+            )
+            return report
+
+        jobs = getters.get_jobs(discovery_id)
+        report.raw["jobs"] = jobs
+        job_lines, report.ok = summarize_jobs(response_items(jobs))
+        report.lines.append(header)
+        report.lines.extend(job_lines)
+    except Exception as exc:  # keep reporting the other jobs
+        report.ok = False
+        report.lines.append("Verification failed: {}: {}".format(type(exc).__name__, exc))
+    return report
+
+
+def verify_submitted(
+    results: Sequence[tuple[str, Any]],
+    getters: ApiGetters,
+    timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
+) -> list[JobReport]:
+    reports: list[JobReport] = []
+    for profile, response in results:
+        task_id = task_id_from_response(response)
+        if task_id is None:
+            reports.append(
+                JobReport(
+                    profile,
+                    False,
+                    ["The submission response has no task ID: {}".format(json.dumps(redact(response), default=str))],
+                )
+            )
+            continue
+        print(
+            "Checking {} (task {}, waiting up to {}s)...".format(profile, task_id, int(timeout)),
+            file=sys.stderr,
+        )
+        reports.append(verify_job(profile, getters, task_id=task_id, timeout=timeout))
+    return reports
+
+
+def print_reports(reports: Sequence[JobReport], raw: bool = False) -> int:
+    """Print every report; return 0 when all are OK, otherwise 1."""
+    for report in reports:
+        print("[{}] {}".format(report.label, "OK" if report.ok else "PROBLEM"))
+        for line in report.lines:
+            print("  " + line)
+        if raw:
+            print(json.dumps(redact(report.raw), indent=2, default=str))
+    return 0 if all(report.ok for report in reports) else 1
