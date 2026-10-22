@@ -50,11 +50,17 @@ from catalystcentersdk import CatalystCenterAPI
 from catalystcentersdk.exceptions import catalystcentersdkException
 from dotenv import load_dotenv
 
+# Reading guide: [main task] marks where the real work happens, [credentials]
+# where credentials or secrets are read, looked up or kept out of output, and
+# [error handling] where input is checked or errors are caught and explained.
+
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
 REQUEST_TIMEOUT_SECONDS = 30
 POLL_INTERVAL_SECONDS = 5
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
+# Discovery states that mean "not finished yet". These values were not confirmed on a
+# live controller; run with --raw to see what yours returns.
 _RUNNING_CONDITIONS = {"in progress", "inprogress", "in-progress", "queued", "pending", "starting", "running"}
 _SECRET_KEY_PARTS = ("password", "passphrase", "community", "secret", "token")
 _MAX_TEXT = 300
@@ -75,6 +81,8 @@ NO_ENV_HINT = (
 # ===========================================================================
 
 
+# [credentials] Only the API login is needed here (no credential profiles). It comes from
+# .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
     base_url: str
@@ -94,6 +102,8 @@ def find_env_file() -> Path | None:
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Read settings from the environment (after loading .env, which never overrides it)."""
+    # [credentials] Load .env into the environment (the file is optional). Variables that
+    # are already set in the real environment win over the file.
     no_env_file = False
     if environ is None:
         env_file = find_env_file()
@@ -105,6 +115,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
+    # [error handling] Check everything up front, so a mistake in .env is reported
+    # before any API call is made.
     required = ["CATALYST_CENTER_BASE_URL", "CATALYST_CENTER_USERNAME", "CATALYST_CENTER_PASSWORD"]
     missing = [name for name in required if not get(name)]
     if missing:
@@ -121,6 +133,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     if ca_bundle and not Path(ca_bundle).is_file():
         raise ScriptError("CATALYST_CENTER_CA_BUNDLE is not a readable file")
 
+    # Lab only: certificate checking can be switched off, but never together with a CA bundle.
     verify_text = get("CATALYST_CENTER_VERIFY_SSL").lower()
     if verify_text in ("", "true", "1", "yes", "on"):
         verify_ssl = True
@@ -156,7 +169,7 @@ def warn_if_insecure(settings: Settings) -> None:
 
 
 def connect(settings: Settings) -> CatalystCenterAPI:
-    # The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
+    # [credentials] Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
     # and sends it with every later call.
     return CatalystCenterAPI(
         username=settings.username,
@@ -181,6 +194,7 @@ class Report:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -192,6 +206,8 @@ def redact(value: Any) -> Any:
     return value
 
 
+# Catalyst Center wraps results in {"response": ...}. These helpers tolerate missing or
+# unexpected fields (names not confirmed live), so a surprise never crashes a check.
 def _body(response: Any) -> Mapping[str, Any]:
     body = response.get("response") if isinstance(response, Mapping) else None
     return body if isinstance(body, Mapping) else {}
@@ -202,6 +218,7 @@ def _items(response: Any) -> list[Mapping[str, Any]]:
     return [item for item in body if isinstance(item, Mapping)] if isinstance(body, list) else []
 
 
+# Long task messages are shortened, so one odd response cannot flood the screen.
 def _short(value: Any) -> str:
     text = str(value)
     return text if len(text) <= _MAX_TEXT else text[:_MAX_TEXT] + "..."
@@ -209,6 +226,7 @@ def _short(value: Any) -> str:
 
 def _poll(fetch: Callable[[], Any], done: Callable[[Any], bool], deadline: float, interval: float,
           sleep: Callable[[float], None], clock: Callable[[], float]) -> tuple[Any, bool]:
+    # Check; if not finished, wait and check again until the deadline passes.
     while True:
         value = fetch()
         if done(value):
@@ -240,7 +258,7 @@ def follow_discovery(api: CatalystCenterAPI, report: Report, discovery_id: str, 
                      interval: float, timeout: float, sleep: Callable[[float], None],
                      clock: Callable[[], float], hint: str) -> None:
     """Wait for a discovery to finish, then add its per-IP results to the report."""
-    # GET /dna/intent/api/v1/discovery/{id}
+    # Wait for the discovery to stop running (GET /dna/intent/api/v1/discovery/{id}).
     discovery, finished = _poll(
         lambda: api.discovery.get_discovery_by_id(discovery_id),
         lambda d: str(_body(d).get("discoveryCondition") or "").strip().lower() not in _RUNNING_CONDITIONS,
@@ -253,7 +271,8 @@ def follow_discovery(api: CatalystCenterAPI, report: Report, discovery_id: str, 
     if not finished:
         report.lines.append(header + ". Still running after {}s; check later with: {}".format(int(timeout), hint))
         return
-    # GET /dna/intent/api/v1/discovery/{id}/job
+    # One result per device (ping, SNMP and CLI). The job is OK only if all of them
+    # succeeded (GET /dna/intent/api/v1/discovery/{id}/job).
     jobs = api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
     report.raw["jobs"] = jobs
     device_lines, report.ok = summarize_devices(_items(jobs))
@@ -265,15 +284,19 @@ def check(api: CatalystCenterAPI, task_id: str | None, discovery_id: str | None,
           timeout: float, interval: float = POLL_INTERVAL_SECONDS,
           sleep: Callable[[float], None] = time.sleep,
           clock: Callable[[], float] = time.monotonic) -> Report:
+    # [main task] Check a task by ID: still running, failed or completed. With --discovery,
+    # also follow it into the devices it discovered.
     report = Report("task {}".format(task_id) if task_id else "discovery {}".format(discovery_id))
     deadline = clock() + timeout
     try:
+        # --discovery-id: check a discovery directly, without looking at a task.
         if discovery_id:
             follow_discovery(api, report, discovery_id, deadline, interval, timeout, sleep, clock,
                              "python check_task.py --discovery-id {}".format(discovery_id))
             return report
 
-        # GET /dna/intent/api/v1/task/{taskId}
+        # Wait for the task (GET /dna/intent/api/v1/task/{taskId}).
+        # [error handling] A failed task is reported with its error code and reason.
         task, finished = _poll(
             lambda: api.task.get_task_by_id(task_id),
             lambda t: bool(_body(t).get("isError")) or bool(_body(t).get("endTime")),
@@ -293,6 +316,7 @@ def check(api: CatalystCenterAPI, task_id: str | None, discovery_id: str | None,
 
         report.ok = True
         report.lines.append("Task {} completed: {}".format(task_id, _short(body.get("progress") or "no result text")))
+        # For a discovery task, the result of a finished task is the discovery ID.
         if follow:
             discovery_id = str(body.get("progress") or "").strip()
             if not discovery_id:
@@ -305,6 +329,7 @@ def check(api: CatalystCenterAPI, task_id: str | None, discovery_id: str | None,
                              "python check_task.py {} --discovery".format(task_id))
         else:
             report.lines.append("If this task started a discovery, add --discovery to see its devices.")
+    # [error handling] A failed check becomes a PROBLEM line instead of a crash.
     except (catalystcentersdkException, requests.RequestException, OSError) as exc:
         report.ok = False
         report.lines.append("Check failed: {}: {}".format(type(exc).__name__, exc))
@@ -336,18 +361,25 @@ def main() -> int:
     parser.add_argument("--raw", action="store_true",
                         help="also print the controller's raw responses (secrets redacted)")
     args = parser.parse_args()
+    # [error handling] Exactly one of a task ID or --discovery-id is required.
     if bool(args.task_id) == bool(args.discovery_id):
         parser.error("give exactly one of: a task ID, or --discovery-id")
     if args.discovery and args.discovery_id:
         parser.error("--discovery is for task IDs; --discovery-id already checks the discovery")
 
     try:
+        # [credentials] Only the API login is read from .env here. Lab only: warn if
+        # certificate checking is off.
         settings = load_settings()
         warn_if_insecure(settings)
+        # [main task] Log in and check the task.
         report = check(connect(settings), args.task_id, args.discovery_id, args.discovery, args.timeout)
+    # [error handling] Expected problems (bad settings, an SDK or network error) print one line
+    # and exit 1. Anything unexpected still shows a full traceback.
     except (ScriptError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
         return 1
+    # Exit code 0 only if the task completed (and, with --discovery, every device is OK).
     return print_report(report, args.raw)
 
 

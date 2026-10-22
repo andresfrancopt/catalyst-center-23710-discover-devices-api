@@ -186,6 +186,16 @@ Because each file carries its own copy of the shared code (settings, IP and rang
 - Run with `--dry-run` first and confirm the payload is accepted by your 2.3.7.10 controller.
 - The verification step relies on response fields I could not check against a live 2.3.7.10 controller while building this: `isError`/`endTime`/`failureReason`/`errorCode` on the task, the discovery ID being in the finished task's `progress` field, `discoveryCondition`/`numDevices` on the discovery, and `ipAddress`/`pingStatus`/`snmpStatus`/`cliStatus`/`errorDescription` on each job entry. The parsers tolerate missing fields (the job is then reported as not verified rather than crashing). Run once with `--raw` on your lab to confirm the names. It was tested against a local simulated controller only.
 
+## Reading the code
+
+Every script starts with a short "reading guide" comment, and the code is commented in short, plain-English notes. A few of them carry a tag at the start, so you can scan or search for them (for example, search for `[credentials]`):
+
+- `[main task]`: where the script does its real work (submitting a discovery, creating a credential, waiting for and reporting the results).
+- `[credentials]`: where credentials or secrets are read from `.env` or the environment, looked up on the controller, typed at a prompt, or kept out of printed output.
+- `[error handling]`: where input is validated up front, or an error is caught and turned into a clear message.
+
+In the main scripts the steps of `main()` are numbered (Step 1 to Step 5), so you can follow the flow from top to bottom. Wherever the same code appears in several files, the comment text is the same too.
+
 ## Tests
 
 ```sh

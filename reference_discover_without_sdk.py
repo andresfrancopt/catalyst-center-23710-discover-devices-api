@@ -54,6 +54,10 @@ from discovery_common import (
     verify_submitted,
 )
 
+# Reading guide: [main task] marks where the real work happens, [credentials]
+# where credentials or secrets are read, looked up or kept out of output, and
+# [error handling] where input is checked or errors are caught and explained.
+
 # ---------------------------------------------------------------------------
 # EDIT HERE: (IP address, credential profile defined in .env).
 # Use None for the default profile. Each profile becomes one discovery job.
@@ -66,6 +70,7 @@ DEVICES = [
 JOB_NAME_PREFIX = "discover"
 # ---------------------------------------------------------------------------
 
+# API paths used below. With the SDK you never write these: it knows them.
 AUTH_PATH = "/dna/system/api/v1/auth/token"
 DISCOVERY_PATH = "/dna/intent/api/v1/discovery"
 DISCOVERY_ID_PATH = "/dna/intent/api/v1/discovery/{id}"
@@ -76,12 +81,15 @@ TASK_PATH = "/dna/intent/api/v1/task/{id}"
 
 def get_token(settings: Settings) -> str:
     # With the SDK this is automatic: CatalystCenterAPI(username=..., password=...)
+    # [credentials] Send the API username and password to get a token for the later calls.
     response = requests.post(
         settings.base_url + AUTH_PATH,
         auth=(settings.username, settings.password),  # HTTP Basic auth
         verify=settings.verify,
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+    # [error handling] An HTTP error status (such as 401 for a wrong password) becomes an
+    # exception; a reply without a token is treated as an error too.
     response.raise_for_status()
     token = response.json().get("Token")
     if not token:
@@ -99,6 +107,7 @@ def call(settings: Settings, token: str, method: str, path: str, **kwargs) -> di
         timeout=REQUEST_TIMEOUT_SECONDS,
         **kwargs,
     )
+    # [error handling] An HTTP error status becomes an exception, which main() reports.
     response.raise_for_status()
     return response.json()
 
@@ -112,6 +121,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        # Step 1: read the settings ([credentials]: API login and profiles from .env) and check
+        # the devices ([error handling]: bad IPs or unknown profiles stop here, before any API call).
         settings = load_settings()
         groups = group_by_profile(DEVICES, settings)
 
@@ -125,14 +136,18 @@ def main() -> int:
                 print(json.dumps(payload, indent=2))
             return 0
 
+        # Lab only: prints a warning when certificate checking is switched off in .env.
         apply_tls_policy(settings)
+        # Step 2 [credentials]: log in. The SDK does this for you; here we do it by hand.
         token = get_token(settings)
 
+        # Small helper so every call below reuses the same token and TLS settings.
         def api(method: str, path: str, **kwargs) -> dict:
             return call(settings, token, method, path, **kwargs)
 
-        # GET /dna/intent/api/v1/global-credential: turn the descriptions or IDs
-        # in .env into real credential IDs, and stop early if one is missing.
+        # Step 3 [credentials]: GET /dna/intent/api/v1/global-credential. Turn the
+        # descriptions or IDs in .env into real credential IDs and stop early if one is
+        # missing ([error handling]), so a typo never reaches the controller.
         settings = resolve_settings(
             settings,
             groups,
@@ -142,6 +157,8 @@ def main() -> int:
         )
         jobs = build_jobs(groups, settings, JOB_NAME_PREFIX)
 
+        # Step 4 [main task]: submit the discovery, once per credential profile. This only starts
+        # it; the discovery keeps running on the controller.
         # With the SDK this is api.discovery.start_discovery(payload=...)
         results = run_jobs(
             jobs, lambda payload: api("POST", DISCOVERY_PATH, json=payload)
@@ -159,7 +176,8 @@ def main() -> int:
             )
             return 0
 
-        # Discovery is asynchronous: follow each task, then the discovery itself.
+        # Step 5 [main task]: discovery is asynchronous, so follow each task, then the
+        # discovery itself, then each device.
         getters = ApiGetters(
             get_task=lambda task_id: api("GET", TASK_PATH.format(id=task_id)),
             get_discovery=lambda discovery_id: api(
@@ -170,10 +188,13 @@ def main() -> int:
             ),
         )
         reports = verify_submitted(results, getters, args.timeout)
+    # [error handling] Expected problems (bad settings, a failed submission, an HTTP or network
+    # error) print one line and exit 1. Anything unexpected still shows a full traceback.
     except (ConfigError, JobSubmissionError, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
         return 1
 
+    # Exit code 0 only if every job succeeded.
     return print_reports(reports, args.raw)
 
 

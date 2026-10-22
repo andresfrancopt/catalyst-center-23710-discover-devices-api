@@ -61,6 +61,10 @@ from catalystcentersdk import CatalystCenterAPI
 from catalystcentersdk.exceptions import MalformedRequest, catalystcentersdkException
 from dotenv import load_dotenv
 
+# Reading guide: [main task] marks where the real work happens, [credentials]
+# where credentials or secrets are read, looked up or kept out of output, and
+# [error handling] where input is checked or errors are caught and explained.
+
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
 REQUEST_TIMEOUT_SECONDS = 30
@@ -70,6 +74,7 @@ CLI_SUBTYPE = "CLI"
 SNMPV2_RO_SUBTYPE = "SNMPV2_READ_COMMUNITY"
 LABELS = {CLI_SUBTYPE: "CLI", SNMPV2_RO_SUBTYPE: "SNMPv2 read-only"}
 _SECRET_KEY_PARTS = ("password", "passphrase", "community", "secret", "token")
+# [credentials] Environment variables read by --from-env, as an alternative to the hidden prompt.
 ENV_CLI_PASSWORD = "NEW_CLI_PASSWORD"
 ENV_CLI_ENABLE_PASSWORD = "NEW_CLI_ENABLE_PASSWORD"
 ENV_SNMP_COMMUNITY = "NEW_SNMP_RO_COMMUNITY"
@@ -90,6 +95,8 @@ NO_ENV_HINT = (
 # ===========================================================================
 
 
+# [credentials] Only the API login is needed here (no credential profiles). It comes from
+# .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
     base_url: str
@@ -109,6 +116,8 @@ def find_env_file() -> Path | None:
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Read settings from the environment (after loading .env, which never overrides it)."""
+    # [credentials] Load .env into the environment (the file is optional). Variables that
+    # are already set in the real environment win over the file.
     no_env_file = False
     if environ is None:
         env_file = find_env_file()
@@ -120,6 +129,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
+    # [error handling] Check everything up front, so a mistake in .env is reported
+    # before any API call is made.
     required = ["CATALYST_CENTER_BASE_URL", "CATALYST_CENTER_USERNAME", "CATALYST_CENTER_PASSWORD"]
     missing = [name for name in required if not get(name)]
     if missing:
@@ -136,6 +147,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     if ca_bundle and not Path(ca_bundle).is_file():
         raise ScriptError("CATALYST_CENTER_CA_BUNDLE is not a readable file")
 
+    # Lab only: certificate checking can be switched off, but never together with a CA bundle.
     verify_text = get("CATALYST_CENTER_VERIFY_SSL").lower()
     if verify_text in ("", "true", "1", "yes", "on"):
         verify_ssl = True
@@ -171,7 +183,7 @@ def warn_if_insecure(settings: Settings) -> None:
 
 
 def connect(settings: Settings) -> CatalystCenterAPI:
-    # The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
+    # [credentials] Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
     # and sends it with every later call.
     return CatalystCenterAPI(
         username=settings.username,
@@ -188,6 +200,7 @@ def connect(settings: Settings) -> CatalystCenterAPI:
 # ===========================================================================
 
 
+# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     """Copy of a structure with secret-looking fields replaced by ***."""
     if isinstance(value, Mapping):
@@ -200,6 +213,8 @@ def redact(value: Any) -> Any:
     return value
 
 
+# [credentials] Remove secret values from text. [error handling] SDK errors can echo the
+# whole request, so error messages are scrubbed before they are printed.
 def scrub(text: str, secrets: Sequence[str]) -> str:
     """Remove secret values from text, e.g. error messages that echo the request."""
     for secret in secrets:
@@ -208,6 +223,8 @@ def scrub(text: str, secrets: Sequence[str]) -> str:
     return text
 
 
+# [credentials] Secrets are typed at a hidden prompt, asked twice to catch typos, and never
+# passed as command-line arguments (those end up in shell history and process lists).
 def prompt_secret(label: str, *, required: bool, ask: Callable[[str], str] | None = None) -> str:
     """Ask for a secret twice. Optional secrets may be left blank."""
     ask = ask or getpass.getpass
@@ -221,6 +238,7 @@ def prompt_secret(label: str, *, required: bool, ask: Callable[[str], str] | Non
     return first
 
 
+# [credentials] For unattended runs (--from-env): read a secret from an environment variable.
 def env_secret(name: str, *, required: bool, environ: Mapping[str, str] | None = None) -> str:
     value = (os.environ if environ is None else environ).get(name, "")
     if required and not value:
@@ -304,6 +322,8 @@ def wait_for_task(api: CatalystCenterAPI, response: Any, timeout: float,
         task = api.task.get_task_by_id(str(task_id))
         info = task.get("response") if isinstance(task, Mapping) else None
         info = info if isinstance(info, Mapping) else {}
+        # [error handling] A task error becomes a clear message with the controller's error
+        # code and reason.
         if info.get("isError"):
             code = info.get("errorCode")
             reason = info.get("failureReason") or info.get("progress") or "no reason given"
@@ -323,6 +343,7 @@ def wait_for_task(api: CatalystCenterAPI, response: Any, timeout: float,
 
 
 def cmd_list(api: CatalystCenterAPI, args: argparse.Namespace) -> int:
+    # [main task] Show every CLI and SNMPv2 read-only credential: name and ID, never secrets.
     for subtype in (CLI_SUBTYPE, SNMPV2_RO_SUBTYPE):
         items = list_credentials(api, subtype)
         print("{} credentials ({}):".format(LABELS[subtype], len(items)))
@@ -334,6 +355,7 @@ def cmd_list(api: CatalystCenterAPI, args: argparse.Namespace) -> int:
 
 
 def cmd_check(api: CatalystCenterAPI, args: argparse.Namespace) -> int:
+    # [main task] Find a credential by ID, description or (CLI) username. Exit code 1 if none matches.
     subtypes = {"cli": [CLI_SUBTYPE], "snmp-ro": [SNMPV2_RO_SUBTYPE]}.get(args.type, [CLI_SUBTYPE, SNMPV2_RO_SUBTYPE])
     total = 0
     for subtype in subtypes:
@@ -353,14 +375,18 @@ def create_credential(api: CatalystCenterAPI, subtype: str, payload: dict[str, A
     description = payload["description"]
     label = LABELS[subtype]
 
+    # Step 1: never create duplicates. If the description already exists, report it and stop.
     existing = find_by_description(list_credentials(api, subtype), description)
     if existing:
         print("{} credential {!r} already exists ({}); nothing was created or changed.".format(
             label, description, describe(existing[0], subtype)))
         return 0
 
+    # Step 2 [credentials]: only now ask for the secrets, so nobody types a password just to
+    # be told the credential already exists.
     secret_fields, secrets = get_secrets()
     payload = {**payload, **secret_fields}
+    # Step 3 [main task]: create the credential. If the controller answers with a task, wait for it.
     try:
         # POST /dna/intent/api/v1/global-credential/cli  (or .../snmpv2-read-community)
         if subtype == CLI_SUBTYPE:
@@ -369,13 +395,16 @@ def create_credential(api: CatalystCenterAPI, subtype: str, payload: dict[str, A
             response = api.discovery.create_snmp_read_community(payload=[payload])
         wait_for_task(api, response, timeout)
     except MalformedRequest as exc:
-        # The SDK's message echoes the whole request, secrets included.
+        # [error handling] The SDK's message echoes the whole request, secrets included, so
+        # only its reason is shown.
         raise ScriptError("The SDK rejected the request: {}".format(
             scrub(str(exc).split("Reason:")[-1].strip(), secrets))) from None
+    # [error handling] Any other SDK or network error is shown with secrets scrubbed out.
     except (catalystcentersdkException, requests.RequestException) as exc:
         raise ScriptError("Creating the {} credential failed ({}): {}".format(
             label, type(exc).__name__, scrub(str(exc), secrets))) from None
 
+    # Step 4: confirm by listing again. Success is only reported if the credential is really there.
     created = wait_for_credential(api, subtype, description, timeout)
     if created is None:
         print("The controller accepted the request, but {} credential {!r} is not in the list after {}s. "
@@ -388,12 +417,15 @@ def create_credential(api: CatalystCenterAPI, subtype: str, payload: dict[str, A
 
 def cmd_create_cli(api: CatalystCenterAPI | None, args: argparse.Namespace) -> int:
     description, username = args.description.strip(), args.username.strip()
+    # [error handling] Blank values are rejected before anything is sent.
     if not description or not username:
         raise ScriptError("--description and --username must not be empty")
 
+    # The request body without secrets; the secrets are added later, only if needed.
     payload: dict[str, Any] = {"credentialType": "GLOBAL", "description": description, "username": username}
     if args.comments:
         payload["comments"] = args.comments
+    # --dry-run: show the request with secrets masked. Needs no .env file and no connection.
     if args.dry_run:
         payload.update({"password": "<prompted>", "enablePassword": "<prompted, optional>"})
         print("# Dry run: nothing was sent. You would be asked for the password and an optional enable password.")
@@ -401,6 +433,7 @@ def cmd_create_cli(api: CatalystCenterAPI | None, args: argparse.Namespace) -> i
         return 0
 
     def get_secrets() -> tuple[dict[str, Any], list[str]]:
+        # [credentials] Passwords come from the environment (--from-env) or hidden prompts.
         if args.from_env:
             password = env_secret(ENV_CLI_PASSWORD, required=True)
             enable = env_secret(ENV_CLI_ENABLE_PASSWORD, required=False)
@@ -418,12 +451,15 @@ def cmd_create_cli(api: CatalystCenterAPI | None, args: argparse.Namespace) -> i
 
 def cmd_create_snmp_ro(api: CatalystCenterAPI | None, args: argparse.Namespace) -> int:
     description = args.description.strip()
+    # [error handling] A blank description is rejected before anything is sent.
     if not description:
         raise ScriptError("--description must not be empty")
 
+    # The request body without secrets; the secrets are added later, only if needed.
     payload: dict[str, Any] = {"credentialType": "GLOBAL", "description": description}
     if args.comments:
         payload["comments"] = args.comments
+    # --dry-run: show the request with secrets masked. Needs no .env file and no connection.
     if args.dry_run:
         payload["readCommunity"] = "<prompted>"
         print("# Dry run: nothing was sent. You would be asked for the read community.")
@@ -431,6 +467,7 @@ def cmd_create_snmp_ro(api: CatalystCenterAPI | None, args: argparse.Namespace) 
         return 0
 
     def get_secrets() -> tuple[dict[str, Any], list[str]]:
+        # [credentials] The read community comes from the environment (--from-env) or a hidden prompt.
         community = (env_secret(ENV_SNMP_COMMUNITY, required=True) if args.from_env
                      else prompt_secret("SNMP read community", required=True))
         return {"readCommunity": community}, [community]
@@ -446,6 +483,8 @@ def cmd_create_snmp_ro(api: CatalystCenterAPI | None, args: argparse.Namespace) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # Four commands: list, check, create-cli and create-snmp-ro. Secrets are deliberately not
+    # command-line options (see prompt_secret).
     commands = parser.add_subparsers(dest="command", required=True)
 
     listing = commands.add_parser("list", help="list CLI and SNMPv2 read-only credentials (no secrets shown)")
@@ -476,11 +515,13 @@ def main() -> int:
     try:
         offline = args.command.startswith("create") and args.dry_run
         api = None
+        # [credentials] Read the API login from .env and log in, unless this is a dry run.
         if not offline:  # a dry run needs no .env and no connection
             settings = load_settings()
             warn_if_insecure(settings)
             api = connect(settings)
 
+        # [main task] Run the chosen command.
         if args.command == "list":
             return cmd_list(api, args)
         if args.command == "check":
@@ -488,6 +529,8 @@ def main() -> int:
         if args.command == "create-cli":
             return cmd_create_cli(api, args)
         return cmd_create_snmp_ro(api, args)
+    # [error handling] Expected problems (bad input, an SDK or network error) print one line and
+    # exit 1. Anything unexpected still shows a full traceback.
     except (ScriptError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
         return 1

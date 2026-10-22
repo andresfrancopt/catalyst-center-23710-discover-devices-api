@@ -41,6 +41,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import urllib3
 from dotenv import load_dotenv
 
+# Reading guide: [main task] marks where the real work happens, [credentials]
+# where credentials or secrets are read, looked up or kept out of output, and
+# [error handling] where input is checked or errors are caught and explained.
+
 DEFAULT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -64,6 +68,8 @@ class JobSubmissionError(RuntimeError):
     """A discovery job failed; earlier jobs may already have been submitted."""
 
 
+# [credentials] A profile is one named set of credentials (IDs or descriptions) for
+# devices that share the same logins. One discovery job is submitted per profile.
 @dataclass(frozen=True)
 class CredentialProfile:
     name: str
@@ -75,6 +81,7 @@ class CredentialProfile:
         return list(self.cli_ids + self.snmpv2_ro_ids)
 
 
+# [credentials] The API login and profiles come from .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
     base_url: str
@@ -124,6 +131,9 @@ def _split_ids(raw: str) -> tuple[str, ...]:
     return tuple(ids)
 
 
+# [credentials] Reads each profile named in CREDENTIAL_PROFILES from the variables
+# CRED_<NAME>_CLI_IDS and CRED_<NAME>_SNMPV2_RO_IDS.
+# [error handling] A bad or incomplete profile stops the script before any API call.
 def _load_profiles(get: Callable[[str], str]) -> dict[str, CredentialProfile]:
     profiles: dict[str, CredentialProfile] = {}
     for raw_name in get("CREDENTIAL_PROFILES").split(","):
@@ -164,6 +174,8 @@ def load_settings(
     Variables already present in the real environment win over .env values.
     Scripts that only talk to the API (not submit jobs) can skip the profiles.
     """
+    # [credentials] Load .env into the environment. Variables that are already set in
+    # the real environment win over the file.
     if environ is None:
         if not Path(dotenv_path).is_file():
             raise ConfigError(
@@ -177,6 +189,8 @@ def load_settings(
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
+    # [error handling] Check everything up front, so a mistake in .env is reported
+    # before any API call is made.
     missing = [
         name
         for name in (
@@ -201,6 +215,7 @@ def load_settings(
     if ca_bundle is not None and not Path(ca_bundle).is_file():
         raise ConfigError("CATALYST_CENTER_CA_BUNDLE is not a readable file")
 
+    # Lab only: certificate checking can be switched off, but never together with a CA bundle.
     verify_ssl = _parse_bool(
         "CATALYST_CENTER_VERIFY_SSL", get("CATALYST_CENTER_VERIFY_SSL"), True
     )
@@ -244,6 +259,8 @@ def group_by_profile(
     groups: OrderedDict[str, list[str]] = OrderedDict()
     seen: set[str] = set()
     for raw_ip, raw_profile in devices:
+        # [error handling] Reject bad IPs, repeated IPs and unknown profiles now, not
+        # halfway through a run.
         ip = normalize_ip(raw_ip)
         if ip in seen:
             raise ConfigError("IP address listed more than once: {}".format(ip))
@@ -298,6 +315,8 @@ def address_list(ip_addresses: Sequence[str]) -> tuple[str, str]:
 def build_payload(
     name: str, ip_addresses: Sequence[str], profile: CredentialProfile
 ) -> dict[str, Any]:
+    # The discovery type and IP list depend on the IPs (see address_list); the other
+    # fields are fixed defaults.
     discovery_type, ip_list = address_list(ip_addresses)
     return {
         "name": name,
@@ -317,6 +336,7 @@ def build_jobs(
     prefix = name_prefix.strip()
     if not prefix:
         raise ConfigError("The discovery name prefix must not be blank")
+    # One job per profile, so each group of devices is only tried with its own credentials.
     return [
         (profile, build_payload("{}-{}".format(prefix, profile), ips, settings.profiles[profile]))
         for profile, ips in groups.items()
@@ -329,6 +349,8 @@ def run_jobs(
 ) -> list[tuple[str, Any]]:
     """Submit one job per profile; stop at the first failure."""
     results: list[tuple[str, Any]] = []
+    # [main task] Submit the jobs one by one. [error handling] On the first failure,
+    # stop and say which jobs were already submitted, so nothing is silently half done.
     for profile, payload in jobs:
         try:
             results.append((profile, submit(payload)))
@@ -380,10 +402,13 @@ def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) ->
     def by_text(name: str) -> Callable[[Mapping[str, Any]], bool]:
         return lambda item: str(item.get(name) or "").strip().lower() == wanted.lower()
 
+    # [credentials] Try an exact ID first, then the description, then (CLI only) the username.
     stages = [("ID", by_id), ("description", by_text("description"))]
     if kind == CLI_SUBTYPE:
         stages.append(("username", by_text("username")))
 
+    # [error handling] Several matches, or none, raise an error that lists what exists
+    # (names and IDs only, never secrets).
     for stage, test in stages:
         found = [item for item in items if test(item)]
         if len(found) > 1:
@@ -424,6 +449,8 @@ def resolve_settings(
     list_credentials(subtype) must return the controller's
     GET /dna/intent/api/v1/global-credential response for that subtype.
     """
+    # [credentials] Ask the controller for its credentials (once per type) and swap each
+    # value from .env for the real credential ID, which is what a discovery job needs.
     cache: dict[str, list[Mapping[str, Any]]] = {}
 
     def items(subtype: str) -> list[Mapping[str, Any]]:
@@ -448,6 +475,7 @@ def resolve_settings(
                 )
             )
         except ConfigError as exc:
+            # [error handling] Name the profile, so the bad .env entry is easy to find.
             raise ConfigError("Profile {!r}: {}".format(name, exc)) from exc
         resolved[name] = CredentialProfile(name, cli, snmp)
     return replace(settings, profiles=resolved)
@@ -459,6 +487,8 @@ def resolve_settings(
 
 POLL_INTERVAL_SECONDS = 5
 DEFAULT_WAIT_TIMEOUT_SECONDS = 300
+# Discovery states that mean "not finished yet". These values were not confirmed on a
+# live controller; run with --raw to see what yours returns.
 _RUNNING_CONDITIONS = {"in progress", "inprogress", "in-progress", "queued", "pending", "starting", "running"}
 _SENSITIVE_KEY_PARTS = ("password", "passphrase", "community", "secret", "token")
 
@@ -499,6 +529,7 @@ def add_wait_arguments(parser: Any) -> None:
     )
 
 
+# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -512,6 +543,8 @@ def redact(value: Any) -> Any:
     return value
 
 
+# Catalyst Center wraps results in {"response": ...}. These helpers tolerate missing or
+# unexpected fields (names not confirmed live), so a surprise never crashes a check.
 def task_id_from_response(response: Any) -> str | None:
     body = response.get("response") if isinstance(response, Mapping) else None
     task_id = body.get("taskId") if isinstance(body, Mapping) else None
@@ -541,6 +574,7 @@ def _poll(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> tuple[Any, bool]:
+    # Check; if not finished, wait and check again until the deadline passes.
     while True:
         value = fetch()
         if done(value):
@@ -596,9 +630,13 @@ def verify_job(
     clock: Callable[[], float] = time.monotonic,
 ) -> JobReport:
     """Follow a job: task result, then discovery completion, then per-IP results."""
+    # [main task] Follow a submitted job in three steps: the task, then the discovery,
+    # then each device.
     report = JobReport(label, False)
     deadline = clock() + timeout
     try:
+        # Step 1: wait for the task. [error handling] A failed task is reported with its
+        # error code and reason.
         if discovery_id is None:
             if not task_id:
                 raise ValueError("a task ID or a discovery ID is required")
@@ -631,6 +669,8 @@ def verify_job(
                 return report
             report.lines.append("Task {} completed".format(task_id))
 
+        # Step 2: the finished task's result is the discovery ID; wait until that
+        # discovery stops running.
         discovery, finished = _poll(
             lambda: getters.get_discovery(discovery_id),
             lambda response: not _discovery_running(response),
@@ -654,11 +694,15 @@ def verify_job(
             )
             return report
 
+        # Step 3: one result per device (ping, SNMP and CLI). The job is OK only if all of
+        # them succeeded.
         jobs = getters.get_jobs(discovery_id)
         report.raw["jobs"] = jobs
         job_lines, report.ok = summarize_jobs(response_items(jobs))
         report.lines.append(header)
         report.lines.extend(job_lines)
+    # [error handling] Turn any failure into a PROBLEM line, so the other jobs are still
+    # reported.
     except Exception as exc:  # keep reporting the other jobs
         report.ok = False
         report.lines.append("Verification failed: {}: {}".format(type(exc).__name__, exc))
@@ -671,6 +715,8 @@ def verify_submitted(
     timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
 ) -> list[JobReport]:
     reports: list[JobReport] = []
+    # [main task] Check every submitted job. [error handling] A response without a task
+    # ID is reported as a problem, not skipped.
     for profile, response in results:
         task_id = task_id_from_response(response)
         if task_id is None:
