@@ -513,7 +513,7 @@ def _poll(fetch: Callable[[], Any], done: Callable[[Any], bool], deadline: float
 
 
 def summarize_devices(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
-    """One line per IP; ok only when ping, SNMP and CLI all succeeded."""
+    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried)."""
     if not jobs:
         return ["- no per-IP results were returned"], False
     lines, all_ok = [], True
@@ -521,11 +521,17 @@ def summarize_devices(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], boo
         status = {key: str(job.get(name) or "-")
                   for key, name in (("ping", "pingStatus"), ("snmp", "snmpStatus"), ("cli", "cliStatus"))}
         ok = all(value.strip().lower() == "success" for value in status.values())
+        # NETCONF is shown only when it was tried (it is NOT-PROVIDED otherwise); a failure needs attention.
+        netconf = str(job.get("netconfStatus") or "").strip()
+        if netconf.lower() not in ("", "not-provided", "not-validated"):
+            status["netconf"] = netconf
+            ok = ok and netconf.lower() == "success"
         all_ok = all_ok and ok
         detail = next((str(job[n]) for n in ("errorDescription", "errDescription", "errorCode") if job.get(n)), "")
-        lines.append("- {ip:<15} {state}  ping={ping} snmp={snmp} cli={cli}{detail}".format(
+        lines.append("- {ip:<15} {state}  {protocols}{detail}".format(
             ip=str(job.get("ipAddress") or "?"), state="OK       " if ok else "ATTENTION",
-            detail=": " + detail if detail else "", **status))
+            protocols=" ".join("{}={}".format(key, value) for key, value in status.items()),
+            detail=": " + detail if detail else ""))
     return lines, all_ok
 
 

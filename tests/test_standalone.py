@@ -292,7 +292,16 @@ class ParityTests(unittest.TestCase):
         failing = {"response": [
             {"ipAddress": "10.0.0.2", "pingStatus": "Success", "snmpStatus": "Success",
              "cliStatus": "Failed", "errorDescription": "CLI login failed"}]}
-        for jobs in (GOOD_JOBS, failing, {"response": []}):
+        netconf_ok = {"response": [
+            {"ipAddress": "10.0.0.3", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+             "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"}]}
+        netconf_failed = {"response": [
+            {"ipAddress": "10.0.0.4", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+             "cliStatus": "SUCCESS", "netconfStatus": "FAILURE", "errorDescription": "NETCONF refused"}]}
+        netconf_unused = {"response": [
+            {"ipAddress": "10.0.0.5", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+             "cliStatus": "SUCCESS", "netconfStatus": "NOT-PROVIDED"}]}
+        for jobs in (GOOD_JOBS, failing, {"response": []}, netconf_ok, netconf_failed, netconf_unused):
             expected = common.summarize_jobs(common.response_items(jobs))
             self.assertEqual(ips_mod.summarize_devices(ips_mod.response_items(jobs)), expected)
             self.assertEqual(csv_mod.summarize_devices(csv_mod.response_items(jobs)), expected)
@@ -300,6 +309,26 @@ class ParityTests(unittest.TestCase):
         sample = discovery("Complete")
         for mod in (ips_mod, csv_mod, task_mod, cred_mod):
             self.assertEqual(mod.redact(sample), common.redact(sample))
+
+    def test_netconf_status_is_shown_and_failure_needs_attention(self) -> None:
+        def line(**extra):
+            job = {"ipAddress": "10.0.0.9", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+                   "cliStatus": "SUCCESS", **extra}
+            lines, ok = common.summarize_jobs([job])
+            return lines[0], ok
+
+        self.assertEqual(line(netconfStatus="SUCCESS"),
+                         ("- 10.0.0.9        OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS", True))
+        text, ok = line(netconfStatus="FAILURE")
+        self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE", text)
+        self.assertFalse(ok)
+        for unused in ("NOT-PROVIDED", "NOT-VALIDATED", ""):
+            text, ok = line(netconfStatus=unused)
+            self.assertNotIn("netconf", text)
+            self.assertTrue(ok)
+        text, ok = line()
+        self.assertNotIn("netconf", text)
+        self.assertTrue(ok)
 
 
 # ---------------------------------------------------------------------------
