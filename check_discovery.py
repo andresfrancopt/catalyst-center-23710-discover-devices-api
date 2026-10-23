@@ -97,9 +97,6 @@ def main() -> int:
             get_jobs=lambda discovery_id: (
                 api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
             ),
-            get_devices=lambda discovery_id: (
-                api.discovery.get_network_devices_from_discovery(discovery_id)
-            ),
         )
         label = "task {}".format(args.task_id) if args.task_id else "discovery {}".format(args.discovery_id)
         # [main task] Follow the job: the task (unless a discovery ID was given), then the

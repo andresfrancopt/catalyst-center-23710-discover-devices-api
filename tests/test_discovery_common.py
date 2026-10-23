@@ -504,16 +504,21 @@ REAL_TASK = {
         "id": "task-1",
     }
 }
-# The one entry the real controller returned from /discovery/{id}/job: no IP, no statuses.
-REAL_JOB_ENTRY = {"response": [{"id": "job-1", "name": "mynewdemo-default", "secret": "do-not-print"}]}
+# The one record the real controller returns from /discovery/{id}/job: a job record with a
+# status and times, but no IP and no per-protocol statuses.
+REAL_JOB_ENTRY = {"response": [{"name": "demo-default", "taskId": "1792756860432",
+                                "startTime": "1792756860435", "endTime": "1792756865591",
+                                "jobStatus": "SUCCESS"}]}
+UNRECOGNISED_ENTRY = {"response": [{"id": "job-1", "name": "x", "secret": "do-not-print"}]}
+NETCONF_JOBS = {"response": [
+    {"ipAddress": "10.0.0.1", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+     "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"},
+    {"ipAddress": "10.0.0.2", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+     "cliStatus": "SUCCESS", "netconfStatus": "FAILURE"}]}
 
 
 class NotFound(Exception):
     status_code = 404
-
-
-def devices_response(*entries):
-    return {"response": list(entries)}
 
 
 class DeviceResultsTests(unittest.TestCase):
@@ -536,50 +541,50 @@ class DeviceResultsTests(unittest.TestCase):
         self.assertEqual(seen, ["581"])
         self.assertTrue(report.ok, report.lines)
 
-    def test_summary_results_are_preferred_and_show_netconf(self) -> None:
-        devices = devices_response(
-            {"ipAddress": "10.0.0.1", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
-             "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"},
-            {"ipAddress": "10.0.0.2", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
-             "cliStatus": "SUCCESS", "netconfStatus": "FAILURE"},
-        )
+    def test_the_real_job_record_is_a_success_without_misleading_errors(self) -> None:
+        getters = ApiGetters(sequence(REAL_TASK), sequence(discovery("Complete")), sequence(REAL_JOB_ENTRY))
+        report, _ = verify(getters, task_id="task-1")
+        text = "\n".join(report.lines)
+        self.assertTrue(report.ok, report.lines)
+        self.assertIn("Complete, 2 device(s)", text)
+        self.assertIn("- discovery job status: SUCCESS", text)
+        self.assertIn("per-device and per-credential results are not available", text)
+        for misleading in ("unrecognised", "ATTENTION", "ping=", "?"):
+            self.assertNotIn(misleading, text)
 
-        def no_jobs(_id):
-            raise AssertionError("the /job call must not be used when /summary has results")
+    def test_a_failed_job_status_needs_attention(self) -> None:
+        job = {"response": [{"jobStatus": "FAILURE"}]}
+        report, _ = verify(ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(job)),
+                           task_id="task-1")
+        self.assertFalse(report.ok)
+        self.assertIn("- discovery job status: FAILURE", report.lines)
 
-        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), no_jobs, sequence(devices))
+    def test_a_discovery_with_no_devices_is_a_problem(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete", 0)), sequence(REAL_JOB_ENTRY))
+        report, _ = verify(getters, task_id="task-1")
+        self.assertFalse(report.ok)
+        self.assertIn("- no devices were discovered", report.lines)
+
+    def test_per_ip_statuses_are_shown_when_the_controller_returns_them(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(NETCONF_JOBS))
         report, _ = verify(getters, task_id="task-1")
         text = "\n".join(report.lines)
         self.assertFalse(report.ok)
         self.assertIn("OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS", text)
         self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE", text)
-        self.assertEqual(report.raw["devices"], devices)
-        self.assertNotIn("jobs", report.raw)
+        self.assertNotIn("not available", text)
 
-    def test_falls_back_to_the_job_call_when_summary_fails_or_is_empty(self) -> None:
-        def broken(_id):
-            raise NotFound("no such call")
-
-        for devices in (broken, sequence({"response": []})):
-            getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(GOOD_JOBS), devices)
-            report, _ = verify(getters, task_id="task-1")
-            self.assertTrue(report.ok, report.lines)
-            self.assertEqual(report.raw["jobs"], GOOD_JOBS)
-
-    def test_unrecognised_entry_lists_field_names_and_never_values(self) -> None:
-        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(REAL_JOB_ENTRY))
+    def test_unknown_record_lists_field_names_and_never_values(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(UNRECOGNISED_ENTRY))
         report, _ = verify(getters, task_id="task-1")
         text = "\n".join(report.lines)
         self.assertFalse(report.ok)
         self.assertIn("unrecognised result (fields: id, name, secret); run with --raw", text)
         self.assertNotIn("do-not-print", text)
-        self.assertNotIn("ping=-", text)
 
-    def test_count_mismatch_is_noted(self) -> None:
-        lines, ok = summarize_jobs(GOOD_JOBS["response"], expected=3)
-        self.assertTrue(ok)
-        self.assertIn("note: the discovery reports 3 device(s) but 2 result(s) were returned", lines[-1])
-        self.assertEqual(len(summarize_jobs(GOOD_JOBS["response"], expected=2)[0]), 2)
+    def test_summarize_jobs_directly(self) -> None:
+        self.assertEqual(summarize_jobs([], 2)[1], False)
+        self.assertEqual(summarize_jobs(REAL_JOB_ENTRY["response"], None)[1], True)
 
     def test_deleted_discovery_gets_a_clear_message(self) -> None:
         def missing(_id):

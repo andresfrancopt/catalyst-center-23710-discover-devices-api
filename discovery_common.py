@@ -515,17 +515,11 @@ _SENSITIVE_KEY_PARTS = ("password", "passphrase", "community", "secret", "token"
 
 @dataclass(frozen=True)
 class ApiGetters:
-    """The read calls verification needs; SDK and requests both provide them.
-
-    get_devices is the preferred per-device call (/discovery/{id}/summary, which has the
-    ping/SNMP/CLI/NETCONF status per IP);
-    get_jobs (/discovery/{id}/job) is used when it is missing, fails or is empty.
-    """
+    """The read calls verification needs; SDK and requests both provide them."""
 
     get_task: Callable[[str], Any]
     get_discovery: Callable[[str], Any]
     get_jobs: Callable[[str], Any]
-    get_devices: Callable[[str], Any] | None = None
 
 
 @dataclass
@@ -684,26 +678,36 @@ _IP_FIELDS = ("ipAddress", "managementIpAddress", "deviceIp")
 _STATUS_FIELDS = ("pingStatus", "snmpStatus", "cliStatus", "netconfStatus")
 
 
-def summarize_jobs(jobs: Sequence[Mapping[str, Any]], expected: int | None = None) -> tuple[list[str], bool]:
-    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried).
+def summarize_jobs(jobs: Sequence[Mapping[str, Any]], num_devices: int | None = None) -> tuple[list[str], bool]:
+    """Report what the discovery returned: per-IP statuses if present, else the job status.
 
-    expected is the device count the discovery reports; a different number of results
-    only adds a note.
+    A per-IP line is ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was
+    tried). Catalyst Center 2.3.7.10 returns only a job record (jobStatus, times) from the
+    /job call, with no per-device or per-credential results, so those are left to the user.
     """
-    if not jobs:
-        return ["- no per-IP results were returned"], False
-
     lines: list[str] = []
     all_ok = True
+    if num_devices == 0:
+        lines.append("- no devices were discovered")
+        all_ok = False
+    if not jobs:
+        return lines + ["- no job result was returned"], False
+
+    detailed = False
     for job in jobs:
         ip = next((str(job[name]) for name in _IP_FIELDS if job.get(name)), "")
-        # An entry with no IP and no status is not a per-device result: show its field names
-        # (never values) instead of a row of '?' and '-'.
         if not ip and not any(job.get(name) for name in _STATUS_FIELDS):
-            names = ", ".join(sorted(str(key) for key in job)) or "none"
-            lines.append("- unrecognised result (fields: {}); run with --raw".format(names))
-            all_ok = False
+            # A job-level record: all it says is whether the discovery job succeeded.
+            job_status = str(job.get("jobStatus") or "").strip()
+            if job_status:
+                lines.append("- discovery job status: {}".format(job_status))
+                all_ok = all_ok and job_status.lower() == "success"
+            else:
+                names = ", ".join(sorted(str(key) for key in job)) or "none"
+                lines.append("- unrecognised result (fields: {}); run with --raw".format(names))
+                all_ok = False
             continue
+        detailed = True
         statuses = {
             key: str(job.get(field_name) or "-")
             for key, field_name in (("ping", "pingStatus"), ("snmp", "snmpStatus"), ("cli", "cliStatus"))
@@ -731,26 +735,13 @@ def summarize_jobs(jobs: Sequence[Mapping[str, Any]], expected: int | None = Non
                 detail=": " + detail if detail else "",
             )
         )
-    if expected is not None and expected != len(jobs):
-        lines.append("- note: the discovery reports {} device(s) but {} result(s) were returned".format(
-            expected, len(jobs)))
+    if not detailed:
+        lines.append(
+            "- note: per-device and per-credential results are not available from Catalyst Center here; "
+            "to confirm which protocols (SSH, SNMP, NETCONF) worked, check the discovery in the "
+            "Catalyst Center GUI or the inventory (standalone/list_devices.py)"
+        )
     return lines, all_ok
-
-
-def fetch_device_results(getters: ApiGetters, discovery_id: str, raw: dict[str, Any]) -> list[Mapping[str, Any]]:
-    """Per-device results: /summary first, then /job. The responses read go into raw."""
-    if getters.get_devices is not None:
-        try:
-            devices = getters.get_devices(discovery_id)
-            raw["devices"] = devices
-            items = response_items(devices)
-            if items:
-                return items
-        except Exception as exc:  # fall back to the /job call below
-            raw["devices_error"] = "{}: {}".format(type(exc).__name__, exc)
-    jobs = getters.get_jobs(discovery_id)
-    raw["jobs"] = jobs
-    return response_items(jobs)
 
 
 def verify_job(
@@ -837,14 +828,16 @@ def verify_job(
             )
             return report
 
-        # Step 3: one result per device (ping, SNMP, CLI and NETCONF if used). The job is OK
-        # only if all of them succeeded.
-        results = fetch_device_results(getters, discovery_id, report.raw)
+        # Step 3: the discovery job result (GET /discovery/{id}/job). The job is OK when it
+        # succeeded and devices were found; per-IP statuses are shown only if the controller
+        # returns them.
+        jobs = getters.get_jobs(discovery_id)
+        report.raw["jobs"] = jobs
         try:
-            expected = int(info.get("numDevices"))
+            num_devices = int(info.get("numDevices"))
         except (TypeError, ValueError):
-            expected = None
-        job_lines, report.ok = summarize_jobs(results, expected)
+            num_devices = None
+        job_lines, report.ok = summarize_jobs(response_items(jobs), num_devices)
         report.lines.append(header)
         report.lines.extend(job_lines)
     # [error handling] Turn any failure into a PROBLEM line, so the other jobs are still

@@ -46,6 +46,7 @@ from test_discovery_common import (
     REAL_JOB_ENTRY,
     REAL_TASK,
     RUNNING_TASK,
+    UNRECOGNISED_ENTRY,
     FakeTime,
     discovery,
 )
@@ -495,17 +496,13 @@ class DeviceResultsTests(unittest.TestCase):
         yield "discover_csv", csv_mod.follow_job(api, "p", "t1", 60, sleep=fake.sleep, clock=fake.clock)
         yield "check_task", task_mod.check(api, "t1", None, True, 60, sleep=fake.sleep, clock=fake.clock)
 
-    def api(self, devices=None, jobs=GOOD_JOBS, discovery_error=None):
+    def api(self, jobs=GOOD_JOBS, discovery_error=None):
         api = MagicMock()
         api.task.get_task_by_id.return_value = REAL_TASK
         if discovery_error:
             api.discovery.get_discovery_by_id.side_effect = discovery_error
         else:
             api.discovery.get_discovery_by_id.return_value = discovery("Complete")
-        if isinstance(devices, Exception):
-            api.discovery.get_network_devices_from_discovery.side_effect = devices
-        elif devices is not None:
-            api.discovery.get_network_devices_from_discovery.return_value = devices
         api.discovery.get_list_of_discoveries_by_discovery_id.return_value = jobs
         return api
 
@@ -518,25 +515,37 @@ class DeviceResultsTests(unittest.TestCase):
             with self.subTest(script=name):
                 self.assertIn('Discovery 581 "discover-default"', "\n".join(report.lines))
 
-    def test_summary_results_show_netconf_and_replace_the_job_call(self) -> None:
+    def test_the_real_job_record_is_a_success_without_misleading_errors(self) -> None:
+        for name, report in self.reports(self.api(REAL_JOB_ENTRY)):
+            with self.subTest(script=name):
+                text = "\n".join(report.lines)
+                self.assertTrue(report.ok, report.lines)
+                self.assertIn("- discovery job status: SUCCESS", text)
+                self.assertIn("per-device and per-credential results are not available", text)
+                for misleading in ("unrecognised", "ATTENTION", "ping=", "?"):
+                    self.assertNotIn(misleading, text)
+
+    def test_failed_job_and_empty_discovery_need_attention(self) -> None:
+        for name, report in self.reports(self.api({"response": [{"jobStatus": "FAILURE"}]})):
+            with self.subTest(script=name, case="failed job"):
+                self.assertFalse(report.ok)
+                self.assertIn("- discovery job status: FAILURE", report.lines)
+        for mod in (ips_mod, csv_mod, task_mod):
+            lines, ok = mod.summarize_devices(REAL_JOB_ENTRY["response"], 0)
+            self.assertFalse(ok)
+            self.assertIn("- no devices were discovered", lines)
+
+    def test_per_ip_statuses_show_netconf_when_the_controller_returns_them(self) -> None:
         for name, report in self.reports(self.api(self.NETCONF_DEVICES)):
             with self.subTest(script=name):
                 text = "\n".join(report.lines)
                 self.assertFalse(report.ok)
                 self.assertIn("OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS", text)
                 self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE", text)
-                self.assertIn("devices", report.raw)
-                self.assertNotIn("jobs", report.raw)
+                self.assertNotIn("not available", text)
 
-    def test_falls_back_to_the_job_call(self) -> None:
-        for devices in (catalystcentersdkException("no such call"), {"response": []}):
-            for name, report in self.reports(self.api(devices)):
-                with self.subTest(script=name, devices=type(devices).__name__):
-                    self.assertTrue(report.ok, report.lines)
-                    self.assertEqual(report.raw["jobs"], GOOD_JOBS)
-
-    def test_unrecognised_entry_lists_field_names_only(self) -> None:
-        for name, report in self.reports(self.api(devices={"response": []}, jobs=REAL_JOB_ENTRY)):
+    def test_unknown_record_lists_field_names_only(self) -> None:
+        for name, report in self.reports(self.api(UNRECOGNISED_ENTRY)):
             with self.subTest(script=name):
                 text = "\n".join(report.lines)
                 self.assertFalse(report.ok)
@@ -560,12 +569,14 @@ class DeviceResultsTests(unittest.TestCase):
                 self.assertFalse(report.ok)
                 self.assertIn("boom", report.lines[-1])
 
-    def test_count_note_and_parity_with_the_common_module(self) -> None:
-        for entries, expected in ((GOOD_JOBS["response"], 3), (GOOD_JOBS["response"], 2),
-                                  (REAL_JOB_ENTRY["response"], 2), (self.NETCONF_DEVICES["response"], None)):
-            want = common.summarize_jobs(entries, expected)
+    def test_parity_with_the_common_module(self) -> None:
+        for entries, num_devices in ((GOOD_JOBS["response"], 3), (GOOD_JOBS["response"], 2),
+                                     (REAL_JOB_ENTRY["response"], 2), (REAL_JOB_ENTRY["response"], 0),
+                                     (UNRECOGNISED_ENTRY["response"], 2), ([], 2),
+                                     (self.NETCONF_DEVICES["response"], None)):
+            want = common.summarize_jobs(entries, num_devices)
             for mod in (ips_mod, csv_mod, task_mod):
-                self.assertEqual(mod.summarize_devices(entries, expected), want)
+                self.assertEqual(mod.summarize_devices(entries, num_devices), want)
         self.assertEqual(common.parse_task_result(REAL_TASK["response"]), ("581", "1792754668237"))
 
 
