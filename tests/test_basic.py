@@ -32,7 +32,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 BASIC = Path(__file__).resolve().parent.parent / "basic"
-NAMES = ["get_credential_ids.py", "discover.py", "check_task.py", "discover_without_sdk.py"]
+NAMES = ["get_credential_ids.py", "discover.py", "check_task.py", "discover_without_sdk.py",
+         "get_credential_ids_without_sdk.py"]
 ALLOWED_IMPORTS = {"os", "sys", "dotenv", "catalystcentersdk", "requests"}
 
 ENV = {
@@ -181,6 +182,44 @@ class DiscoverWithoutSdkTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_script(env={**ENV, "CLI_CREDENTIAL_ID": ""}, post=post)
         post.assert_not_called()
+
+
+class CredentialIdsWithoutSdkTests(unittest.TestCase):
+    def run_script(self, get):
+        out = io.StringIO()
+        post = MagicMock(return_value=MagicMock(json=lambda: {"Token": "tok-1"}))
+        with patch.dict("os.environ", ENV, clear=True), patch("dotenv.load_dotenv"), \
+                patch("requests.post", post), patch("requests.get", get), redirect_stdout(out):
+            runpy.run_path(str(BASIC / "get_credential_ids_without_sdk.py"), run_name="__main__")
+        return out.getvalue(), post
+
+    def test_does_not_use_the_sdk(self):
+        tree = ast.parse((BASIC / "get_credential_ids_without_sdk.py").read_text())
+        names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertNotIn("catalystcentersdk", names)
+        self.assertIn("requests", names)
+
+    def test_lists_ids_and_never_secrets(self):
+        get = MagicMock(side_effect=[
+            MagicMock(json=lambda: {"response": [
+                {"id": "c1", "description": "CSS", "username": "admin", "password": "TOPSECRET"}]}),
+            MagicMock(json=lambda: {"response": [
+                {"id": "s1", "description": "RO", "readCommunity": "TOPSECRET"}]}),
+        ])
+        out, post = self.run_script(get)
+        self.assertIn("CSS  id=c1  username=admin", out)
+        self.assertIn("RO  id=s1", out)
+        for secret in ("TOPSECRET", "api-secret-value", "tok-1"):
+            self.assertNotIn(secret, out)
+        self.assertEqual(post.call_args.args[0], "https://cc.example.com/dna/system/api/v1/auth/token")
+        self.assertEqual(post.call_args.kwargs["auth"], ("api-user", "api-secret-value"))
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertEqual(urls, ["https://cc.example.com/dna/intent/api/v1/global-credential"] * 2)
+        self.assertEqual([c.kwargs["params"] for c in get.call_args_list],
+                         [{"credentialSubType": "CLI"}, {"credentialSubType": "SNMPV2_READ_COMMUNITY"}])
+        for call in get.call_args_list:
+            self.assertEqual(call.kwargs["headers"], {"X-Auth-Token": "tok-1"})
 
 
 class CheckTaskTests(unittest.TestCase):

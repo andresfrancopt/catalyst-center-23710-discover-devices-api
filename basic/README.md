@@ -9,6 +9,7 @@ The smallest working way to discover devices in Catalyst Center 2.3.7.10 with `c
 | [get_credential_ids.py](get_credential_ids.py) | Lists your global CLI and SNMPv2 read credentials with their IDs |
 | [discover.py](discover.py) | Starts a discovery of the IPs in its `IPS` list |
 | [discover_without_sdk.py](discover_without_sdk.py) | The same discovery without `catalystcentersdk`: plain `requests`, same `.env`, same body. Shows the login and the two REST calls the SDK normally hides |
+| [get_credential_ids_without_sdk.py](get_credential_ids_without_sdk.py) | The same credential listing without `catalystcentersdk`: plain `requests`, same `.env` |
 | [check_task.py](check_task.py) | Checks a task once by its ID |
 
 ## Steps
