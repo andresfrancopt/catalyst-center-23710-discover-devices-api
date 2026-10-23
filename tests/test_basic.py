@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import ast
 import io
+import os
 import runpy
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -33,8 +35,8 @@ from unittest.mock import MagicMock, patch
 
 BASIC = Path(__file__).resolve().parent.parent / "basic"
 NAMES = ["get_credential_ids.py", "discover.py", "check_task.py", "discover_without_sdk.py",
-         "get_credential_ids_without_sdk.py"]
-ALLOWED_IMPORTS = {"os", "sys", "dotenv", "catalystcentersdk", "requests"}
+         "get_credential_ids_without_sdk.py", "discover_from_csv.py"]
+ALLOWED_IMPORTS = {"os", "sys", "csv", "dotenv", "catalystcentersdk", "requests"}
 
 ENV = {
     "CATALYST_CENTER_BASE_URL": "https://cc.example.com",
@@ -220,6 +222,69 @@ class CredentialIdsWithoutSdkTests(unittest.TestCase):
                          [{"credentialSubType": "CLI"}, {"credentialSubType": "SNMPV2_READ_COMMUNITY"}])
         for call in get.call_args_list:
             self.assertEqual(call.kwargs["headers"], {"X-Auth-Token": "tok-1"})
+
+
+class DiscoverFromCsvTests(unittest.TestCase):
+    def run_script(self, csv_text, env=None):
+        api = MagicMock()
+        api.discovery.start_discovery.return_value = {"response": {"taskId": "task-5"}}
+        with tempfile.TemporaryDirectory() as folder:
+            if csv_text is not None:
+                (Path(folder) / "devices.csv").write_text(csv_text)
+            cwd = os.getcwd()
+            os.chdir(folder)
+            try:
+                out, _ = run("discover_from_csv.py", api, env=env)
+            finally:
+                os.chdir(cwd)
+        return out, api
+
+    def test_reads_ips_and_ignores_other_columns_and_blank_rows(self):
+        csv_text = "ip_address,credential_profile\n10.0.0.1 ,default\n\n10.0.0.5,branch\n,x\n"
+        out, api = self.run_script(csv_text)
+        payload = api.discovery.start_discovery.call_args.kwargs["payload"]
+        self.assertEqual(payload["ipAddressList"], "10.0.0.1-10.0.0.1,10.0.0.5-10.0.0.5")
+        self.assertEqual(payload["discoveryType"], "Multi Range")
+        self.assertEqual(payload["globalCredentialIdList"], ["cli-id-1", "snmp-id-1"])
+        self.assertIn("Task ID: task-5", out)
+
+    def test_several_credential_ids_from_the_same_env(self):
+        env = {**ENV, "CLI_CREDENTIAL_ID": "cli-a, cli-b", "SNMP_CREDENTIAL_ID": "snmp-a,snmp-b,"}
+        _, api = self.run_script("ip_address\n10.0.0.1\n", env=env)
+        payload = api.discovery.start_discovery.call_args.kwargs["payload"]
+        self.assertEqual(payload["globalCredentialIdList"], ["cli-a", "cli-b", "snmp-a", "snmp-b"])
+
+    def test_no_ips_stops_before_any_call(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_script("ip_address\n\n")
+        self.assertIn("No IP addresses", str(caught.exception))
+
+    def test_empty_credential_ids_stop_before_any_call(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_script("ip_address\n10.0.0.1\n", env={**ENV, "CLI_CREDENTIAL_ID": " , "})
+        self.assertIn("CLI_CREDENTIAL_ID", str(caught.exception))
+
+
+class DiscoverMultipleCredentialTests(unittest.TestCase):
+    ENV = {**ENV, "CLI_CREDENTIAL_ID": "cli-a,cli-b", "SNMP_CREDENTIAL_ID": "snmp-a"}
+
+    def test_sdk_script_sends_all_ids(self):
+        api = MagicMock()
+        api.discovery.start_discovery.return_value = {"response": {"taskId": "t"}}
+        run("discover.py", api, env=self.ENV)
+        payload = api.discovery.start_discovery.call_args.kwargs["payload"]
+        self.assertEqual(payload["globalCredentialIdList"], ["cli-a", "cli-b", "snmp-a"])
+
+    def test_requests_script_sends_all_ids(self):
+        post = MagicMock(side_effect=[
+            MagicMock(json=lambda: {"Token": "tok"}),
+            MagicMock(json=lambda: {"response": {"taskId": "t"}}),
+        ])
+        with patch.dict("os.environ", self.ENV, clear=True), patch("dotenv.load_dotenv"), \
+                patch("requests.post", post), redirect_stdout(io.StringIO()):
+            runpy.run_path(str(BASIC / "discover_without_sdk.py"), run_name="__main__")
+        self.assertEqual(post.call_args.kwargs["json"]["globalCredentialIdList"],
+                         ["cli-a", "cli-b", "snmp-a"])
 
 
 class CheckTaskTests(unittest.TestCase):

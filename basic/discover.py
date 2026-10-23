@@ -36,11 +36,11 @@ IPS = ["10.48.90.173", "10.48.90.174"]
 
 # Read the settings and the two credential IDs from the .env file.
 load_dotenv()
-cli_id = os.environ["CLI_CREDENTIAL_ID"]
-snmp_id = os.environ["SNMP_CREDENTIAL_ID"]
+cli_ids = [i.strip() for i in os.environ["CLI_CREDENTIAL_ID"].split(",") if i.strip()]
+snmp_ids = [i.strip() for i in os.environ["SNMP_CREDENTIAL_ID"].split(",") if i.strip()]
 
 # Stop early with a clear message if an ID is still empty.
-if not cli_id or not snmp_id:
+if not cli_ids or not snmp_ids:
     raise SystemExit("Set CLI_CREDENTIAL_ID and SNMP_CREDENTIAL_ID in .env (see get_credential_ids.py)")
 
 # Connect. The SDK gets the login token for us.
@@ -63,7 +63,7 @@ body = {
     "timeOut": 5,
     "retryCount": 3,
     "isAutoCdp": False,
-    "globalCredentialIdList": [cli_id, snmp_id],
+    "globalCredentialIdList": cli_ids + snmp_ids,
 }
 
 # POST /dna/intent/api/v1/discovery
