@@ -32,8 +32,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 BASIC = Path(__file__).resolve().parent.parent / "basic"
-NAMES = ["get_credential_ids.py", "discover.py", "check_task.py"]
-ALLOWED_IMPORTS = {"os", "sys", "dotenv", "catalystcentersdk"}
+NAMES = ["get_credential_ids.py", "discover.py", "check_task.py", "discover_without_sdk.py"]
+ALLOWED_IMPORTS = {"os", "sys", "dotenv", "catalystcentersdk", "requests"}
 
 ENV = {
     "CATALYST_CENTER_BASE_URL": "https://cc.example.com",
@@ -133,6 +133,54 @@ class DiscoverTests(unittest.TestCase):
             run("discover.py", api, env={**ENV, "SNMP_CREDENTIAL_ID": ""})
         self.assertIn("CLI_CREDENTIAL_ID", str(caught.exception))
         api.discovery.start_discovery.assert_not_called()
+
+
+class DiscoverWithoutSdkTests(unittest.TestCase):
+    def run_script(self, env=None, post=None):
+        out = io.StringIO()
+        post = post or MagicMock(side_effect=[
+            MagicMock(json=lambda: {"Token": "tok-1"}),
+            MagicMock(json=lambda: {"response": {"taskId": "task-7"}}),
+        ])
+        with patch.dict("os.environ", ENV if env is None else env, clear=True), \
+                patch("dotenv.load_dotenv"), patch("requests.post", post), redirect_stdout(out):
+            runpy.run_path(str(BASIC / "discover_without_sdk.py"), run_name="__main__")
+        return out.getvalue(), post
+
+    def test_does_not_use_the_sdk(self):
+        tree = ast.parse((BASIC / "discover_without_sdk.py").read_text())
+        names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertNotIn("catalystcentersdk", names)
+        self.assertIn("requests", names)
+
+    def test_logs_in_then_sends_the_same_body_as_the_sdk_script(self):
+        out, post = self.run_script()
+        login, discovery = post.call_args_list
+        self.assertEqual(login.args[0], "https://cc.example.com/dna/system/api/v1/auth/token")
+        self.assertEqual(login.kwargs["auth"], ("api-user", "api-secret-value"))
+        self.assertIs(login.kwargs["verify"], False)
+        self.assertEqual(discovery.args[0], "https://cc.example.com/dna/intent/api/v1/discovery")
+        self.assertEqual(discovery.kwargs["headers"], {"X-Auth-Token": "tok-1"})
+        self.assertEqual(discovery.kwargs["json"], {
+            "name": "basic-discovery",
+            "discoveryType": "Multi Range",
+            "ipAddressList": "10.48.90.173-10.48.90.173,10.48.90.174-10.48.90.174",
+            "protocolOrder": "ssh",
+            "timeOut": 5,
+            "retryCount": 3,
+            "isAutoCdp": False,
+            "globalCredentialIdList": ["cli-id-1", "snmp-id-1"],
+        })
+        self.assertIn("Task ID: task-7", out)
+        for secret in ("api-secret-value", "tok-1"):
+            self.assertNotIn(secret, out)
+
+    def test_empty_credential_id_stops_before_any_call(self):
+        post = MagicMock()
+        with self.assertRaises(SystemExit):
+            self.run_script(env={**ENV, "CLI_CREDENTIAL_ID": ""}, post=post)
+        post.assert_not_called()
 
 
 class CheckTaskTests(unittest.TestCase):
