@@ -16,6 +16,8 @@ Start Catalyst Center discovery jobs (`POST /dna/intent/api/v1/discovery`) from 
 
 There is also a set of **fully standalone** scripts in [standalone/](standalone) that do the same jobs (plus credential management) without sharing any code; see [Standalone scripts](#standalone-scripts).
 
+New to this? Start with the three minimal scripts in [basic/](basic): no helpers, no profiles, one CLI and one SNMP credential, see [basic/README.md](basic/README.md).
+
 ## Setup (Python 3.14.3, see `.python-version`)
 
 ```sh
