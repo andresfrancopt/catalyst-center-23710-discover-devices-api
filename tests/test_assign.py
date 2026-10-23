@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import _paths  # noqa: F401  (adds 3-shared-module to sys.path)
 import assign_devices_to_site as root_assign
 import discovery_common as common
 from catalystcentersdk.exceptions import catalystcentersdkException

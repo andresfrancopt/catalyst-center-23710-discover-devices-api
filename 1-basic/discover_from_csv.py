@@ -21,7 +21,7 @@
 
 """Basic: start a discovery of the IP addresses listed in devices.csv.
 
-Run (from the project folder):  python basic/discover_from_csv.py
+Run (from this folder):  python discover_from_csv.py
 devices.csv needs a header row with an "ip_address" column; other columns
 are ignored. The discovery runs in the background; use the task ID printed
 at the end with check_task.py. This creates a discovery job in Catalyst Center.

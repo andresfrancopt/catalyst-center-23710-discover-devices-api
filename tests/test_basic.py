@@ -19,7 +19,7 @@
 # validating it, and for any use or execution in their own environments,
 # including production.
 
-"""Tests for the flat scripts in basic/."""
+"""Tests for the flat scripts in 1-basic/."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-BASIC = Path(__file__).resolve().parent.parent / "basic"
+BASIC = Path(__file__).resolve().parent.parent / "1-basic"
 NAMES = ["get_credential_ids.py", "discover.py", "check_task.py", "discover_without_sdk.py",
          "get_credential_ids_without_sdk.py", "discover_from_csv.py"]
 ALLOWED_IMPORTS = {"os", "sys", "csv", "dotenv", "catalystcentersdk", "requests"}

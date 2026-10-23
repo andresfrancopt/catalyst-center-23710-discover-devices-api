@@ -1,0 +1,5 @@
+ip_address,credential_profile,site
+10.48.90.173,default,Global/London/Building1/Floor1
+10.48.90.174,default,Global/London/Building1/Floor1
+10.48.91.10,branch,Global/Paris/Building2
+10.48.91.11,,

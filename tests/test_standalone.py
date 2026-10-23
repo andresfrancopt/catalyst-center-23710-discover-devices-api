@@ -19,7 +19,7 @@
 # validating it, and for any use or execution in their own environments,
 # including production.
 
-"""Tests for the self-contained scripts in standalone/."""
+"""Tests for the self-contained scripts in 2-standalone/."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import _paths  # noqa: F401  (adds 3-shared-module to sys.path)
 import discovery_common as common
 from catalystcentersdk.exceptions import MalformedRequest, catalystcentersdkException
 from test_discovery_common import (
@@ -54,7 +55,7 @@ from test_discovery_common import (
 from test_scripts import CLI_CREDS, DEVICES, SNMP_CREDS, configure
 
 ROOT = Path(__file__).resolve().parent.parent
-STANDALONE = ROOT / "standalone"
+STANDALONE = ROOT / "2-standalone"
 NAMES = ["discover_ips.py", "discover_csv.py", "check_task.py", "manage_credentials.py",
          "list_devices.py", "assign_site.py"]
 

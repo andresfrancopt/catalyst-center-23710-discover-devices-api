@@ -27,6 +27,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+import _paths  # noqa: F401  (adds 3-shared-module to sys.path)
 from discovery_common import (
     CLI_SUBTYPE,
     SNMPV2_RO_SUBTYPE,

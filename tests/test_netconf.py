@@ -31,6 +31,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+import _paths  # noqa: F401  (adds 3-shared-module to sys.path)
 import discover_from_csv
 import discover_ips_in_code
 import discovery_common as common

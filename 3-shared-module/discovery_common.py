@@ -746,7 +746,7 @@ def summarize_jobs(jobs: Sequence[Mapping[str, Any]], num_devices: int | None = 
         lines.append(
             "- note: per-device and per-credential results are not available from Catalyst Center here; "
             "to confirm which protocols (SSH, SNMP, NETCONF) worked, check the discovery in the "
-            "Catalyst Center GUI or the inventory (standalone/list_devices.py)"
+            "Catalyst Center GUI or the inventory (2-standalone/list_devices.py)"
         )
     return lines, all_ok
 

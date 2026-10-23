@@ -28,6 +28,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import _paths  # noqa: F401  (adds 3-shared-module to sys.path)
 import check_discovery
 import discover_from_csv
 import discover_ips_in_code

@@ -203,7 +203,7 @@ def main() -> int:
     lines, ok = assignment_report(items)
     print("\n".join(lines))
     if args.no_wait and not args.dry_run:
-        print("Not waiting for results (--no-wait). Check each task with: python standalone/check_task.py <task-id>")
+        print("Not waiting for results (--no-wait). Check each task with: python ../2-standalone/check_task.py <task-id>")
     if args.raw:
         print(json.dumps(redact(samples), indent=2, default=str))
     print(SITE_REFRESH_REMINDER)
