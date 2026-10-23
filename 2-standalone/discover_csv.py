@@ -55,10 +55,6 @@ from catalystcentersdk import CatalystCenterAPI
 from catalystcentersdk.exceptions import catalystcentersdkException
 from dotenv import load_dotenv
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
-
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
 REQUEST_TIMEOUT_SECONDS = 30
@@ -85,7 +81,7 @@ NO_ENV_HINT = (
 # ===========================================================================
 
 
-# [credentials] A profile is one named set of credentials (IDs or descriptions) for
+# A profile is one named set of credentials (IDs or descriptions) for
 # devices that share the same logins. One discovery job is submitted per profile.
 @dataclass(frozen=True)
 class Profile:
@@ -94,7 +90,7 @@ class Profile:
     snmp: tuple[str, ...]
 
 
-# [credentials] The API login and profiles come from .env or the environment, never hard-coded.
+# The API login and profiles come from .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
     base_url: str
@@ -125,7 +121,7 @@ def _split(raw: str) -> tuple[str, ...]:
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Read settings from the environment (after loading .env, which never overrides it)."""
-    # [credentials] Load .env into the environment (the file is optional). Variables that
+    # Load .env into the environment (the file is optional). Variables that
     # are already set in the real environment win over the file.
     no_env_file = False
     if environ is None:
@@ -138,7 +134,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
-    # [error handling] Check everything up front, so a mistake in .env is reported
+    # Check everything up front, so a mistake in .env is reported
     # before any API call is made.
     required = ["CATALYST_CENTER_BASE_URL", "CATALYST_CENTER_USERNAME",
                 "CATALYST_CENTER_PASSWORD", "CREDENTIAL_PROFILES"]
@@ -174,9 +170,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             "Set either CATALYST_CENTER_CA_BUNDLE or CATALYST_CENTER_VERIFY_SSL=false, not both"
         )
 
-    # [credentials] Reads each profile named in CREDENTIAL_PROFILES from the variables
+    # Reads each profile named in CREDENTIAL_PROFILES from the variables
     # CRED_<NAME>_CLI_IDS and CRED_<NAME>_SNMPV2_RO_IDS.
-    # [error handling] A bad or incomplete profile stops the script before any API call.
+    # A bad or incomplete profile stops the script before any API call.
     profiles: dict[str, Profile] = {}
     for raw_name in get("CREDENTIAL_PROFILES").split(","):
         name = raw_name.strip()
@@ -222,7 +218,7 @@ def warn_if_insecure(settings: Settings) -> None:
 
 
 def connect(settings: Settings) -> CatalystCenterAPI:
-    # [credentials] Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
+    # Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
     # and sends it with every later call.
     return CatalystCenterAPI(
         username=settings.username,
@@ -241,7 +237,7 @@ def connect(settings: Settings) -> CatalystCenterAPI:
 
 def read_devices(csv_path: Path) -> list[tuple[str, str | None]]:
     """Return (ip_address, credential_profile) pairs from the CSV."""
-    # [error handling] A missing column, an empty IP or an empty file stops the script with
+    # A missing column, an empty IP or an empty file stops the script with
     # a clear message. "utf-8-sig" accepts the byte-order mark that Excel adds.
     try:
         with open(csv_path, encoding="utf-8-sig", newline="") as handle:
@@ -272,7 +268,7 @@ def group_by_profile(
     groups: dict[str, list[str]] = {}
     seen: set[str] = set()
     for raw_ip, raw_profile in devices:
-        # [error handling] Reject bad IPs, repeated IPs and unknown profiles now, not
+        # Reject bad IPs, repeated IPs and unknown profiles now, not
         # halfway through a run.
         try:
             address = ipaddress.ip_address(raw_ip.strip())
@@ -426,7 +422,7 @@ def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) ->
     def text_is(name: str) -> Callable[[Mapping[str, Any]], bool]:
         return lambda item: str(item.get(name) or "").strip().lower() == wanted.lower()
 
-    # [credentials] Try an exact ID first, then the description, then (CLI only) the username.
+    # Try an exact ID first, then the description, then (CLI only) the username.
     stages: list[tuple[str, Callable[[Mapping[str, Any]], bool]]] = [
         ("ID", lambda item: wanted in (item.get("id"), item.get("instanceUuid"))),
         ("description", text_is("description")),
@@ -434,7 +430,7 @@ def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) ->
     if kind == CLI_SUBTYPE:
         stages.append(("username", text_is("username")))
 
-    # [error handling] Several matches, or none, raise an error that lists what exists
+    # Several matches, or none, raise an error that lists what exists
     # (names and IDs only, never secrets).
     for stage, test in stages:
         found = [item for item in items if test(item)]
@@ -463,7 +459,7 @@ def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) ->
 
 def resolve_credential_ids(api: CatalystCenterAPI, profile: Profile) -> list[str]:
     """Turn a profile's values into real credential IDs (GET /dna/intent/api/v1/global-credential)."""
-    # [credentials] Ask the controller for its credentials and swap each value from .env for
+    # Ask the controller for its credentials and swap each value from .env for
     # the real credential ID, which is what a discovery job needs.
     try:
         cli_items = response_items(api.discovery.get_global_credentials(CLI_SUBTYPE))
@@ -471,7 +467,7 @@ def resolve_credential_ids(api: CatalystCenterAPI, profile: Profile) -> list[str
         cli = [match_credential(ref, cli_items, CLI_SUBTYPE) for ref in profile.cli]
         snmp = [match_credential(ref, snmp_items, SNMPV2_RO_SUBTYPE) for ref in profile.snmp]
     except ScriptError as exc:
-        # [error handling] Name the profile, so the bad .env entry is easy to find.
+        # Name the profile, so the bad .env entry is easy to find.
         raise ScriptError("Profile {!r}: {}".format(profile.name, exc)) from exc
     return list(dict.fromkeys(cli + snmp))
 
@@ -494,7 +490,7 @@ class Report:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
-# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
+# Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -620,13 +616,13 @@ def follow_job(api: CatalystCenterAPI, label: str, task_id: str, timeout: float,
                sleep: Callable[[float], None] = time.sleep,
                clock: Callable[[], float] = time.monotonic) -> Report:
     """Follow a submitted job: task result, then discovery completion, then per-IP results."""
-    # [main task] Follow a submitted job in three steps: the task, then the discovery,
+    # Follow a submitted job in three steps: the task, then the discovery,
     # then each device.
     report = Report(label)
     deadline = clock() + timeout
     try:
         # Step 1: wait for the task (GET /dna/intent/api/v1/task/{taskId}).
-        # [error handling] A failed task is reported with its error code and reason.
+        # A failed task is reported with its error code and reason.
         task, finished = _poll(
             lambda: api.task.get_task_by_id(task_id),
             lambda t: bool(_body(t).get("isError")) or bool(_body(t).get("endTime")),
@@ -651,7 +647,7 @@ def follow_job(api: CatalystCenterAPI, label: str, task_id: str, timeout: float,
 
         # Step 2: the finished task's result is the discovery ID; wait until that discovery
         # stops running (GET /dna/intent/api/v1/discovery/{id}).
-        # [error handling] A 404 means the discovery no longer exists.
+        # A 404 means the discovery no longer exists.
         try:
             discovery, finished = _poll(
                 lambda: api.discovery.get_discovery_by_id(discovery_id),
@@ -684,7 +680,7 @@ def follow_job(api: CatalystCenterAPI, label: str, task_id: str, timeout: float,
         device_lines, report.ok = summarize_devices(results, num_devices)
         report.lines.append(header)
         report.lines.extend(device_lines)
-    # [error handling] Turn a failure into a PROBLEM line, so the other jobs are still reported.
+    # Turn a failure into a PROBLEM line, so the other jobs are still reported.
     except (catalystcentersdkException, requests.RequestException, OSError) as exc:
         report.ok = False
         report.lines.append("Verification failed: {}: {}".format(type(exc).__name__, exc))
@@ -729,8 +725,8 @@ def main() -> int:
         prefix = args.name_prefix.strip()
         if not prefix:
             raise ScriptError("The discovery name prefix must not be blank")
-        # Step 1: read the settings ([credentials]: API login and profiles from .env) and the CSV
-        # ([error handling]: bad IPs or unknown profiles stop here, before any API call).
+        # Step 1: read the settings (API login and profiles from .env) and the CSV
+        # (bad IPs or unknown profiles stop here, before any API call).
         settings = load_settings()
         groups = group_by_profile(read_devices(args.csv_file), settings)
 
@@ -744,17 +740,17 @@ def main() -> int:
 
         # Lab only: prints a warning when certificate checking is switched off in .env.
         warn_if_insecure(settings)
-        # Step 2 [credentials]: log in (see connect).
+        # Step 2: log in (see connect).
         api = connect(settings)
 
-        # Step 3 [credentials]: look up ALL credentials first (GET /dna/intent/api/v1/global-credential),
-        # so a typo ([error handling]) stops everything before anything is submitted.
+        # Step 3: look up ALL credentials first (GET /dna/intent/api/v1/global-credential),
+        # so a typo stops everything before anything is submitted.
         jobs = []
         for profile, ips in groups.items():
             ids = resolve_credential_ids(api, settings.profiles[profile])
             jobs.append((profile, build_payload("{}-{}".format(prefix, profile), ips, ids, netconf_port)))
 
-        # Step 4 [main task]: submit the discovery (POST /dna/intent/api/v1/discovery), once per
+        # Step 4: submit the discovery (POST /dna/intent/api/v1/discovery), once per
         # credential profile. This only starts it; the discovery keeps running on the controller.
         submitted: list[tuple[str, str]] = []
         for profile, payload in jobs:
@@ -763,7 +759,7 @@ def main() -> int:
                 task_id = _body(response).get("taskId")
                 if not task_id:
                     raise ScriptError("the response has no task ID: {}".format(json.dumps(redact(response), default=str)))
-            # [error handling] On a failure, stop and say which profiles were already submitted.
+            # On a failure, stop and say which profiles were already submitted.
             except (ScriptError, catalystcentersdkException, requests.RequestException) as exc:
                 raise ScriptError("Discovery for profile {!r} failed ({}: {}). Already submitted: {}.".format(
                     profile, type(exc).__name__, exc, ", ".join(p for p, _ in submitted) or "none")) from exc
@@ -774,14 +770,14 @@ def main() -> int:
             print("Not waiting for results (--no-wait). Check later with: python check_task.py <task-id> --discovery")
             return 0
 
-        # Step 5 [main task]: discovery is asynchronous, so follow each task, then the
+        # Step 5: discovery is asynchronous, so follow each task, then the
         # discovery itself, then each device.
         reports = []
         for profile, task_id in submitted:
             print("Checking {} (task {}, waiting up to {}s)...".format(profile, task_id, args.timeout),
                   file=sys.stderr)
             reports.append(follow_job(api, profile, task_id, args.timeout))
-    # [error handling] Expected problems (bad settings, a failed submission, an SDK or network
+    # Expected problems (bad settings, a failed submission, an SDK or network
     # error) print one line and exit 1. Anything unexpected still shows a full traceback.
     except (ScriptError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)

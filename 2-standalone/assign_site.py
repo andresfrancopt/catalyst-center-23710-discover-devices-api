@@ -68,10 +68,6 @@ from catalystcentersdk import CatalystCenterAPI
 from catalystcentersdk.exceptions import catalystcentersdkException
 from dotenv import load_dotenv
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
-
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
 REQUEST_TIMEOUT_SECONDS = 30
@@ -121,7 +117,7 @@ NO_ENV_HINT = (
 # ===========================================================================
 
 
-# [credentials] Only the API login is needed here (no credential profiles). It comes from
+# Only the API login is needed here (no credential profiles). It comes from
 # .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
@@ -142,7 +138,7 @@ def find_env_file() -> Path | None:
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Read settings from the environment (after loading .env, which never overrides it)."""
-    # [credentials] Load .env into the environment (the file is optional). Variables that
+    # Load .env into the environment (the file is optional). Variables that
     # are already set in the real environment win over the file.
     no_env_file = False
     if environ is None:
@@ -155,7 +151,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
-    # [error handling] Check everything up front, so a mistake in .env is reported
+    # Check everything up front, so a mistake in .env is reported
     # before any API call is made.
     required = ["CATALYST_CENTER_BASE_URL", "CATALYST_CENTER_USERNAME", "CATALYST_CENTER_PASSWORD"]
     missing = [name for name in required if not get(name)]
@@ -209,7 +205,7 @@ def warn_if_insecure(settings: Settings) -> None:
 
 
 def connect(settings: Settings) -> CatalystCenterAPI:
-    # [credentials] Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
+    # Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
     # and sends it with every later call.
     return CatalystCenterAPI(
         username=settings.username,
@@ -243,7 +239,7 @@ def task_id_from_response(response: Any) -> str | None:
     return str(task_id) if task_id else None
 
 
-# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
+# Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -255,7 +251,7 @@ def redact(value: Any) -> Any:
     return value
 
 
-# [error handling] The controller returns at most 500 records per request and the SDK does
+# The controller returns at most 500 records per request and the SDK does
 # not page for you, so ask for page after page. Offsets start at 1.
 def fetch_pages(
     fetch_page: Callable[[int, int], list[Mapping[str, Any]]],
@@ -373,7 +369,7 @@ class SiteCache:
     sites: tuple[Mapping[str, str], ...]
 
 
-# [main task] Read every site from the controller (paged) and keep it in a local file, so
+# Read every site from the controller (paged) and keep it in a local file, so
 # later runs do not need to ask for all sites again.
 def refresh_site_cache(
     api: SiteApi,
@@ -433,7 +429,7 @@ def cache_note(cache: SiteCache, now: datetime) -> str:
     return note
 
 
-# [error handling] A site name must match exactly one building or floor. When it does not,
+# A site name must match exactly one building or floor. When it does not,
 # say why and suggest the closest names, and remind the user how to refresh the list.
 def resolve_site(cache: SiteCache, name: str) -> Mapping[str, str]:
     wanted = normalize_site_name(name)
@@ -494,7 +490,7 @@ def normalize_ip(value: str) -> str:
 
 def read_device_sites(csv_path: Path, default_site: str | None = None) -> list[tuple[str, str]]:
     """(ip_address, site) pairs from the CSV. Rows with no site use default_site."""
-    # [error handling] A missing column, an empty IP, a repeated IP, a row with no site or an
+    # A missing column, an empty IP, a repeated IP, a row with no site or an
     # empty file stops the script with a clear message. "utf-8-sig" accepts Excel's byte-order mark.
     rows: list[tuple[str, str | None]] = []
     try:
@@ -565,7 +561,7 @@ def lookup_inventory(api: SiteApi, ips: Sequence[str]) -> dict[str, Mapping[str,
     return found
 
 
-# [main task] Find each CSV device cheaply: read the 'not assigned to a site' list once and
+# Find each CSV device cheaply: read the 'not assigned to a site' list once and
 # match the IPs here, instead of asking about every IP. IPs missing from that list are looked
 # up in the inventory, to tell "already has a site" from "not in the inventory (yet)".
 def locate_devices(
@@ -659,7 +655,7 @@ def wait_for_task(
     return "done", ""
 
 
-# [main task] Assign the devices: one request per site, at most 100 devices each, then wait
+# Assign the devices: one request per site, at most 100 devices each, then wait
 # for each request's task. A failed request does not stop the others.
 def run_assignments(
     api: SiteApi,
@@ -675,7 +671,7 @@ def run_assignments(
             by_site.setdefault(item.site_id, []).append(item)
     for site_id, group in by_site.items():
         for chunk in chunked(group, ASSIGN_BATCH_SIZE):
-            # [error handling] Whatever goes wrong with this request is shown on its devices.
+            # Whatever goes wrong with this request is shown on its devices.
             try:
                 response = api.assign(site_id, [item.device_id for item in chunk])
                 task_id = task_id_from_response(response)
@@ -750,19 +746,19 @@ def main() -> int:
     parser.add_argument("--raw", action="store_true",
                         help="also print the first raw site and device records (secrets redacted)")
     args = parser.parse_args()
-    # [error handling] Something to do is required: a CSV file, or just refreshing the sites.
+    # Something to do is required: a CSV file, or just refreshing the sites.
     if args.csv_file is None and not args.refresh_sites:
         parser.error("give a CSV file, or use --refresh-sites on its own")
 
     try:
-        # Step 1: read the settings ([credentials]: only the API login is needed) and the CSV
-        # ([error handling]: bad or repeated IPs and rows with no site stop the script here).
+        # Step 1: read the settings (only the API login is needed) and the CSV
+        # (bad or repeated IPs and rows with no site stop the script here).
         settings = load_settings()
         rows = read_device_sites(args.csv_file, args.site) if args.csv_file else None
 
         # Lab only: prints a warning when certificate checking is switched off in .env.
         warn_if_insecure(settings)
-        # Step 2 [credentials]: log in (see connect).
+        # Step 2: log in (see connect).
         api = connect(settings)
         samples: dict = {}
         site_api = build_site_api(api, samples if args.raw else None)
@@ -782,11 +778,11 @@ def main() -> int:
             print(SITE_REFRESH_REMINDER)
             return 0
 
-        # [error handling] Every site name must match one building or floor; all problems are
+        # Every site name must match one building or floor; all problems are
         # shown together. A name that is not in the list stops the script (no silent refresh).
         sites = resolve_sites(cache, [site for _, site in rows])
 
-        # Step 4 [main task]: find the devices. The 'not assigned to a site' list is read once
+        # Step 4: find the devices. The 'not assigned to a site' list is read once
         # and matched locally; the rest are looked up in the inventory.
         located = locate_devices(
             site_api, [ip for ip, _ in rows], args.wait_for_devices, ASSIGN_WAIT_INTERVAL_SECONDS)
@@ -795,12 +791,12 @@ def main() -> int:
         if args.dry_run:
             print("Dry run: nothing is assigned. This is what would happen:")
         else:
-            # Step 5 [main task]: assign (one request per site, at most 100 devices each) ...
+            # Step 5: assign (one request per site, at most 100 devices each) ...
             run_assignments(site_api, items, args.timeout, args.no_wait)
             # ... Step 6: confirm the devices really left the 'not assigned' list.
             if not args.no_wait:
                 verify_assignments(site_api, items)
-    # [error handling] Expected problems (bad input, an unknown site, an SDK or network error)
+    # Expected problems (bad input, an unknown site, an SDK or network error)
     # print one line and exit 1. Anything unexpected still shows a full traceback.
     except (ScriptError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)

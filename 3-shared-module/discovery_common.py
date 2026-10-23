@@ -45,10 +45,6 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import urllib3
 from dotenv import load_dotenv
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
-
 DEFAULT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -72,7 +68,7 @@ class JobSubmissionError(RuntimeError):
     """A discovery job failed; earlier jobs may already have been submitted."""
 
 
-# [credentials] A profile is one named set of credentials (IDs or descriptions) for
+# A profile is one named set of credentials (IDs or descriptions) for
 # devices that share the same logins. One discovery job is submitted per profile.
 @dataclass(frozen=True)
 class CredentialProfile:
@@ -85,7 +81,7 @@ class CredentialProfile:
         return list(self.cli_ids + self.snmpv2_ro_ids)
 
 
-# [credentials] The API login and profiles come from .env or the environment, never hard-coded.
+# The API login and profiles come from .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
     base_url: str
@@ -135,9 +131,9 @@ def _split_ids(raw: str) -> tuple[str, ...]:
     return tuple(ids)
 
 
-# [credentials] Reads each profile named in CREDENTIAL_PROFILES from the variables
+# Reads each profile named in CREDENTIAL_PROFILES from the variables
 # CRED_<NAME>_CLI_IDS and CRED_<NAME>_SNMPV2_RO_IDS.
-# [error handling] A bad or incomplete profile stops the script before any API call.
+# A bad or incomplete profile stops the script before any API call.
 def _load_profiles(get: Callable[[str], str]) -> dict[str, CredentialProfile]:
     profiles: dict[str, CredentialProfile] = {}
     for raw_name in get("CREDENTIAL_PROFILES").split(","):
@@ -178,7 +174,7 @@ def load_settings(
     Variables already present in the real environment win over .env values.
     Scripts that only talk to the API (not submit jobs) can skip the profiles.
     """
-    # [credentials] Load .env into the environment. Variables that are already set in
+    # Load .env into the environment. Variables that are already set in
     # the real environment win over the file.
     if environ is None:
         if not Path(dotenv_path).is_file():
@@ -193,7 +189,7 @@ def load_settings(
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
-    # [error handling] Check everything up front, so a mistake in .env is reported
+    # Check everything up front, so a mistake in .env is reported
     # before any API call is made.
     missing = [
         name
@@ -263,7 +259,7 @@ def group_by_profile(
     groups: OrderedDict[str, list[str]] = OrderedDict()
     seen: set[str] = set()
     for raw_ip, raw_profile in devices:
-        # [error handling] Reject bad IPs, repeated IPs and unknown profiles now, not
+        # Reject bad IPs, repeated IPs and unknown profiles now, not
         # halfway through a run.
         ip = normalize_ip(raw_ip)
         if ip in seen:
@@ -369,7 +365,7 @@ def run_jobs(
 ) -> list[tuple[str, Any]]:
     """Submit one job per profile; stop at the first failure."""
     results: list[tuple[str, Any]] = []
-    # [main task] Submit the jobs one by one. [error handling] On the first failure,
+    # Submit the jobs one by one. On the first failure,
     # stop and say which jobs were already submitted, so nothing is silently half done.
     for profile, payload in jobs:
         try:
@@ -422,12 +418,12 @@ def match_credential(ref: str, items: Sequence[Mapping[str, Any]], kind: str) ->
     def by_text(name: str) -> Callable[[Mapping[str, Any]], bool]:
         return lambda item: str(item.get(name) or "").strip().lower() == wanted.lower()
 
-    # [credentials] Try an exact ID first, then the description, then (CLI only) the username.
+    # Try an exact ID first, then the description, then (CLI only) the username.
     stages = [("ID", by_id), ("description", by_text("description"))]
     if kind == CLI_SUBTYPE:
         stages.append(("username", by_text("username")))
 
-    # [error handling] Several matches, or none, raise an error that lists what exists
+    # Several matches, or none, raise an error that lists what exists
     # (names and IDs only, never secrets).
     for stage, test in stages:
         found = [item for item in items if test(item)]
@@ -469,7 +465,7 @@ def resolve_settings(
     list_credentials(subtype) must return the controller's
     GET /dna/intent/api/v1/global-credential response for that subtype.
     """
-    # [credentials] Ask the controller for its credentials (once per type) and swap each
+    # Ask the controller for its credentials (once per type) and swap each
     # value from .env for the real credential ID, which is what a discovery job needs.
     cache: dict[str, list[Mapping[str, Any]]] = {}
 
@@ -495,7 +491,7 @@ def resolve_settings(
                 )
             )
         except ConfigError as exc:
-            # [error handling] Name the profile, so the bad .env entry is easy to find.
+            # Name the profile, so the bad .env entry is easy to find.
             raise ConfigError("Profile {!r}: {}".format(name, exc)) from exc
         resolved[name] = CredentialProfile(name, cli, snmp)
     return replace(settings, profiles=resolved)
@@ -602,7 +598,7 @@ def add_wait_arguments(parser: Any) -> None:
     )
 
 
-# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
+# Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -784,12 +780,12 @@ def verify_job(
     clock: Callable[[], float] = time.monotonic,
 ) -> JobReport:
     """Follow a job: task result, then discovery completion, then per-IP results."""
-    # [main task] Follow a submitted job in three steps: the task, then the discovery,
+    # Follow a submitted job in three steps: the task, then the discovery,
     # then each device.
     report = JobReport(label, False)
     deadline = clock() + timeout
     try:
-        # Step 1: wait for the task. [error handling] A failed task is reported with its
+        # Step 1: wait for the task. A failed task is reported with its
         # error code and reason.
         if discovery_id is None:
             if not task_id:
@@ -824,7 +820,7 @@ def verify_job(
             report.lines.append("Task {} completed".format(task_id))
 
         # Step 2: the finished task's result is the discovery ID; wait until that
-        # discovery stops running. [error handling] A 404 means it no longer exists.
+        # discovery stops running. A 404 means it no longer exists.
         try:
             discovery, finished = _poll(
                 lambda: getters.get_discovery(discovery_id),
@@ -867,7 +863,7 @@ def verify_job(
         job_lines, report.ok = summarize_jobs(results, num_devices)
         report.lines.append(header)
         report.lines.extend(job_lines)
-    # [error handling] Turn any failure into a PROBLEM line, so the other jobs are still
+    # Turn any failure into a PROBLEM line, so the other jobs are still
     # reported.
     except Exception as exc:  # keep reporting the other jobs
         report.ok = False
@@ -881,7 +877,7 @@ def verify_submitted(
     timeout: float = DEFAULT_WAIT_TIMEOUT_SECONDS,
 ) -> list[JobReport]:
     reports: list[JobReport] = []
-    # [main task] Check every submitted job. [error handling] A response without a task
+    # Check every submitted job. A response without a task
     # ID is reported as a problem, not skipped.
     for profile, response in results:
         task_id = task_id_from_response(response)
@@ -943,7 +939,7 @@ SITE_REFRESH_REMINDER = (
 )
 
 
-# [error handling] The controller returns at most 500 records per request and the SDK does
+# The controller returns at most 500 records per request and the SDK does
 # not page for you, so ask for page after page. Offsets start at 1.
 def fetch_pages(
     fetch_page: Callable[[int, int], list[Mapping[str, Any]]],
@@ -1032,7 +1028,7 @@ class SiteCache:
     sites: tuple[Mapping[str, str], ...]
 
 
-# [main task] Read every site from the controller (paged) and keep it in a local file, so
+# Read every site from the controller (paged) and keep it in a local file, so
 # later runs do not need to ask for all sites again.
 def refresh_site_cache(
     api: SiteApi,
@@ -1092,7 +1088,7 @@ def cache_note(cache: SiteCache, now: datetime) -> str:
     return note
 
 
-# [error handling] A site name must match exactly one building or floor. When it does not,
+# A site name must match exactly one building or floor. When it does not,
 # say why and suggest the closest names, and remind the user how to refresh the list.
 def resolve_site(cache: SiteCache, name: str) -> Mapping[str, str]:
     wanted = normalize_site_name(name)
@@ -1207,7 +1203,7 @@ def lookup_inventory(api: SiteApi, ips: Sequence[str]) -> dict[str, Mapping[str,
     return found
 
 
-# [main task] Find each CSV device cheaply: read the 'not assigned to a site' list once and
+# Find each CSV device cheaply: read the 'not assigned to a site' list once and
 # match the IPs here, instead of asking about every IP. IPs missing from that list are looked
 # up in the inventory, to tell "already has a site" from "not in the inventory (yet)".
 def locate_devices(
@@ -1288,7 +1284,7 @@ def wait_for_task(
     return "done", ""
 
 
-# [main task] Assign the devices: one request per site, at most 100 devices each, then wait
+# Assign the devices: one request per site, at most 100 devices each, then wait
 # for each request's task. A failed request does not stop the others.
 def run_assignments(
     api: SiteApi,
@@ -1304,7 +1300,7 @@ def run_assignments(
             by_site.setdefault(item.site_id, []).append(item)
     for site_id, group in by_site.items():
         for chunk in chunked(group, ASSIGN_BATCH_SIZE):
-            # [error handling] Whatever goes wrong with this request is shown on its devices.
+            # Whatever goes wrong with this request is shown on its devices.
             try:
                 response = api.assign(site_id, [item.device_id for item in chunk])
                 task_id = task_id_from_response(response)

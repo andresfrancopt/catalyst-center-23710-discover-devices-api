@@ -58,9 +58,6 @@ from catalystcentersdk import CatalystCenterAPI
 from catalystcentersdk.exceptions import catalystcentersdkException
 from dotenv import load_dotenv
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
 
 # SDK 3.1.6.0.0 has no 2.3.7.10 model; 2.3.7.9 is the nearest earlier one.
 SDK_API_VERSION = "2.3.7.9"
@@ -110,7 +107,7 @@ NO_ENV_HINT = (
 # ===========================================================================
 
 
-# [credentials] Only the API login is needed here (no credential profiles). It comes from
+# Only the API login is needed here (no credential profiles). It comes from
 # .env or the environment, never hard-coded.
 @dataclass(frozen=True)
 class Settings:
@@ -131,7 +128,7 @@ def find_env_file() -> Path | None:
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Read settings from the environment (after loading .env, which never overrides it)."""
-    # [credentials] Load .env into the environment (the file is optional). Variables that
+    # Load .env into the environment (the file is optional). Variables that
     # are already set in the real environment win over the file.
     no_env_file = False
     if environ is None:
@@ -144,7 +141,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     def get(name: str) -> str:
         return environ.get(name, "").strip()
 
-    # [error handling] Check everything up front, so a mistake in .env is reported
+    # Check everything up front, so a mistake in .env is reported
     # before any API call is made.
     required = ["CATALYST_CENTER_BASE_URL", "CATALYST_CENTER_USERNAME", "CATALYST_CENTER_PASSWORD"]
     missing = [name for name in required if not get(name)]
@@ -198,7 +195,7 @@ def warn_if_insecure(settings: Settings) -> None:
 
 
 def connect(settings: Settings) -> CatalystCenterAPI:
-    # [credentials] Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
+    # Log in. The SDK requests the auth token (POST /dna/system/api/v1/auth/token)
     # and sends it with every later call.
     return CatalystCenterAPI(
         username=settings.username,
@@ -241,7 +238,7 @@ def fetch_pages(
         page = fetch_page(offset, page_size)
         if not page:
             return items
-        # [error handling] A controller that ignores "offset" would send the same page forever.
+        # A controller that ignores "offset" would send the same page forever.
         if previous is not None and page == previous:
             raise ScriptError(
                 "The controller returned the same page twice (offset {}), so paging does not "
@@ -285,7 +282,7 @@ def fetch_unassigned_ids(api: CatalystCenterAPI, page_size: int) -> set[str]:
         page_size,
     )
     ids = {str(item["id"]) for item in items if item.get("id")}
-    # [error handling] If the records have no "id" we cannot match them to inventory devices.
+    # If the records have no "id" we cannot match them to inventory devices.
     if items and not ids:
         raise ScriptError(
             "The 'not assigned to a site' list has no device IDs, so it cannot be matched to the "
@@ -317,7 +314,7 @@ def look_up_sites(api: CatalystCenterAPI, devices: Sequence[Mapping[str, Any]]) 
             continue
         try:
             sites[device_id] = site_text(api.site_design.get_site_assigned_network_device(device_id))
-        # [error handling] One device that cannot be looked up must not stop the whole run.
+        # One device that cannot be looked up must not stop the whole run.
         except (catalystcentersdkException, requests.RequestException):
             sites[device_id] = ""
             failures += 1
@@ -367,7 +364,7 @@ def format_table(rows: Sequence[Mapping[str, str]], columns: Sequence[str]) -> s
 _NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
 
 
-# [credentials] [error handling] Inventory text comes from outside, and a spreadsheet runs
+# Inventory text comes from outside, and a spreadsheet runs
 # cells that start with = + - @ as formulas. A leading quote makes them plain text.
 def safe_cell(value: str) -> str:
     if value[:1] in ("=", "+", "@", "\t", "\r") or (value[:1] == "-" and not _NUMBER.match(value)):
@@ -380,7 +377,7 @@ def default_output_name(now: datetime) -> str:
 
 
 def write_csv(path: Path, rows: Sequence[Mapping[str, str]], columns: Sequence[str], overwrite: bool) -> None:
-    # [error handling] Never replace an existing file by accident, and explain a missing folder.
+    # Never replace an existing file by accident, and explain a missing folder.
     if not path.parent.is_dir():
         raise ScriptError("The folder for the CSV file does not exist: {}".format(path.parent))
     try:
@@ -395,7 +392,7 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, str]], columns: Sequence[s
         ) from None
 
 
-# [credentials] Replace secret-looking fields, so raw responses can be printed safely.
+# Replace secret-looking fields, so raw responses can be printed safely.
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -450,12 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(now: Callable[[], datetime] = datetime.now) -> int:
     parser = build_parser()
     args = parser.parse_args()
-    # [error handling] A CSV file cannot be both skipped and named.
+    # A CSV file cannot be both skipped and named.
     if args.no_csv and (args.output or args.overwrite):
         parser.error("--no-csv cannot be combined with --output or --overwrite")
 
     try:
-        # [credentials] Only the API login is read from .env. Lab only: warn if certificate
+        # Only the API login is read from .env. Lab only: warn if certificate
         # checking is off.
         settings = load_settings()
         warn_if_insecure(settings)
@@ -466,7 +463,7 @@ def main(now: Callable[[], datetime] = datetime.now) -> int:
             ("management_ip_address", args.ip), ("hostname", args.hostname), ("family", args.family),
             ("role", args.role), ("reachability_status", args.reachability)) if value}
 
-        # [main task] Read the inventory page by page, because one request returns at most
+        # Read the inventory page by page, because one request returns at most
         # 500 devices and the SDK does not page for you.
         def progress(page: int, total: int) -> None:
             print("  page {}: {} devices read so far".format(page, total), file=sys.stderr)
@@ -489,7 +486,7 @@ def main(now: Callable[[], datetime] = datetime.now) -> int:
         columns = [name for name, _ in COLUMNS] + (["site"] if args.with_site else [])
         screen_columns = SCREEN_COLUMNS + (["site"] if args.with_site else [])
 
-        # [main task] Show the result on screen ...
+        # Show the result on screen ...
         if rows:
             print(format_table(rows, screen_columns))
         else:
@@ -505,7 +502,7 @@ def main(now: Callable[[], datetime] = datetime.now) -> int:
         if args.raw and devices:
             print("First raw device record:")
             print(json.dumps(redact(dict(devices[0])), indent=2, default=str))
-    # [error handling] Expected problems (bad settings, an SDK or network error, a file that
+    # Expected problems (bad settings, an SDK or network error, a file that
     # cannot be written) print one line and exit 1. Anything unexpected still shows a traceback.
     except (ScriptError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)

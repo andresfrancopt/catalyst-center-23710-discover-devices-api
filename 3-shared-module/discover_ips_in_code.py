@@ -60,9 +60,6 @@ from discovery_common import (
     verify_submitted,
 )
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
 
 # ---------------------------------------------------------------------------
 # EDIT HERE: (IP address, credential profile defined in .env).
@@ -90,8 +87,8 @@ def main() -> int:
     announce_netconf(netconf_port)
 
     try:
-        # Step 1: read the settings ([credentials]: API login and profiles from .env) and check
-        # the devices ([error handling]: bad IPs or unknown profiles stop here, before any API call).
+        # Step 1: read the settings (API login and profiles from .env) and check
+        # the devices (bad IPs or unknown profiles stop here, before any API call).
         settings = load_settings()
         groups = group_by_profile(DEVICES, settings)
 
@@ -108,7 +105,7 @@ def main() -> int:
         # Lab only: prints a warning when certificate checking is switched off in .env.
         apply_tls_policy(settings)
 
-        # Step 2 [credentials]: log in. The SDK requests the auth token
+        # Step 2: log in. The SDK requests the auth token
         # (POST /dna/system/api/v1/auth/token) and sends it with every later call.
         api = CatalystCenterAPI(
             username=settings.username,
@@ -119,9 +116,9 @@ def main() -> int:
             single_request_timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
-        # Step 3 [credentials]: .env may hold credential descriptions (like "CSS") or IDs.
+        # Step 3: .env may hold credential descriptions (like "CSS") or IDs.
         # Look them up (GET /dna/intent/api/v1/global-credential) and stop early if one is
-        # missing ([error handling]), so a typo never reaches the controller.
+        # missing, so a typo never reaches the controller.
         settings = resolve_settings(
             settings,
             groups,
@@ -129,7 +126,7 @@ def main() -> int:
         )
         jobs = build_jobs(groups, settings, JOB_NAME_PREFIX, netconf_port)
 
-        # Step 4 [main task]: submit the discovery (POST /dna/intent/api/v1/discovery), once per
+        # Step 4: submit the discovery (POST /dna/intent/api/v1/discovery), once per
         # credential profile. This only starts it; the discovery keeps running on the controller.
         results = run_jobs(
             jobs,
@@ -150,7 +147,7 @@ def main() -> int:
             )
             return 0
 
-        # Step 5 [main task]: discovery is asynchronous, so follow each task, then the
+        # Step 5: discovery is asynchronous, so follow each task, then the
         # discovery itself, then each device.
         getters = ApiGetters(
             get_task=lambda task_id: api.task.get_task_by_id(task_id),
@@ -165,7 +162,7 @@ def main() -> int:
             ),
         )
         reports = verify_submitted(results, getters, args.timeout)
-    # [error handling] Expected problems (bad settings, a failed submission, an SDK or network
+    # Expected problems (bad settings, a failed submission, an SDK or network
     # error) print one line and exit 1. Anything unexpected still shows a full traceback.
     except (
         ConfigError,

@@ -81,10 +81,6 @@ from discovery_common import (
     verify_assignments,
 )
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
-
 DEFAULT_SITES_CACHE = "sites_cache.json"
 
 
@@ -137,19 +133,19 @@ def main() -> int:
     parser.add_argument("--raw", action="store_true",
                         help="also print the first raw site and device records (secrets redacted)")
     args = parser.parse_args()
-    # [error handling] Something to do is required: a CSV file, or just refreshing the sites.
+    # Something to do is required: a CSV file, or just refreshing the sites.
     if args.csv_file is None and not args.refresh_sites:
         parser.error("give a CSV file, or use --refresh-sites on its own")
 
     try:
-        # Step 1: read the settings ([credentials]: only the API login is needed) and the CSV
-        # ([error handling]: bad or repeated IPs and rows with no site stop the script here).
+        # Step 1: read the settings (only the API login is needed) and the CSV
+        # (bad or repeated IPs and rows with no site stop the script here).
         settings = load_settings(require_profiles=False)
         rows = read_device_sites(args.csv_file, args.site) if args.csv_file else None
 
         # Lab only: prints a warning when certificate checking is switched off in .env.
         apply_tls_policy(settings)
-        # Step 2 [credentials]: log in. The SDK requests the auth token and sends it with every call.
+        # Step 2: log in. The SDK requests the auth token and sends it with every call.
         api = CatalystCenterAPI(
             username=settings.username,
             password=settings.password,
@@ -176,11 +172,11 @@ def main() -> int:
             print(SITE_REFRESH_REMINDER)
             return 0
 
-        # [error handling] Every site name must match one building or floor; all problems are
+        # Every site name must match one building or floor; all problems are
         # shown together. A name that is not in the list stops the script (no silent refresh).
         sites = resolve_sites(cache, [site for _, site in rows])
 
-        # Step 4 [main task]: find the devices. The 'not assigned to a site' list is read once
+        # Step 4: find the devices. The 'not assigned to a site' list is read once
         # and matched locally; the rest are looked up in the inventory.
         located = locate_devices(
             site_api, [ip for ip, _ in rows], args.wait_for_devices, ASSIGN_WAIT_INTERVAL_SECONDS)
@@ -189,12 +185,12 @@ def main() -> int:
         if args.dry_run:
             print("Dry run: nothing is assigned. This is what would happen:")
         else:
-            # Step 5 [main task]: assign (one request per site, at most 100 devices each) ...
+            # Step 5: assign (one request per site, at most 100 devices each) ...
             run_assignments(site_api, items, args.timeout, args.no_wait)
             # ... Step 6: confirm the devices really left the 'not assigned' list.
             if not args.no_wait:
                 verify_assignments(site_api, items)
-    # [error handling] Expected problems (bad input, an unknown site, an SDK or network error)
+    # Expected problems (bad input, an unknown site, an SDK or network error)
     # print one line and exit 1. Anything unexpected still shows a full traceback.
     except (ConfigError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)

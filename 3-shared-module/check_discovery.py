@@ -49,10 +49,6 @@ from discovery_common import (
     verify_job,
 )
 
-# Reading guide: [main task] marks where the real work happens, [credentials]
-# where credentials or secrets are read, looked up or kept out of output, and
-# [error handling] where input is checked or errors are caught and explained.
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -69,18 +65,18 @@ def main() -> int:
         action="store_true",
         help="also print the controller's raw responses (secrets redacted)",
     )
-    # [error handling] Exactly one of a task ID or --discovery-id is required.
+    # Exactly one of a task ID or --discovery-id is required.
     args = parser.parse_args()
     if bool(args.task_id) == bool(args.discovery_id):
         parser.error("give exactly one of: a task ID, or --discovery-id")
 
     try:
-        # [credentials] Only the API login is needed here, not the credential profiles.
+        # Only the API login is needed here, not the credential profiles.
         settings = load_settings(require_profiles=False)
         # Lab only: prints a warning when certificate checking is switched off in .env.
         apply_tls_policy(settings)
 
-        # [credentials] Log in; the SDK requests the auth token and sends it with every call.
+        # Log in; the SDK requests the auth token and sends it with every call.
         api = CatalystCenterAPI(
             username=settings.username,
             password=settings.password,
@@ -102,7 +98,7 @@ def main() -> int:
             ),
         )
         label = "task {}".format(args.task_id) if args.task_id else "discovery {}".format(args.discovery_id)
-        # [main task] Follow the job: the task (unless a discovery ID was given), then the
+        # Follow the job: the task (unless a discovery ID was given), then the
         # discovery, then each device.
         report = verify_job(
             label,
@@ -111,7 +107,7 @@ def main() -> int:
             discovery_id=args.discovery_id,
             timeout=args.timeout,
         )
-    # [error handling] Expected problems (bad settings, an SDK or network error) print one
+    # Expected problems (bad settings, an SDK or network error) print one
     # line and exit with 1. Anything unexpected is a bug and still shows a traceback.
     except (ConfigError, catalystcentersdkException, requests.RequestException, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
