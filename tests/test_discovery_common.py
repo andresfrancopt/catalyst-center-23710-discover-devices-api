@@ -43,9 +43,11 @@ from discovery_common import (
     load_settings,
     match_credential,
     normalize_ip,
+    parse_task_result,
     print_reports,
     resolve_settings,
     run_jobs,
+    summarize_jobs,
     task_id_from_response,
     verify_job,
     verify_submitted,
@@ -487,6 +489,112 @@ class VerifyJobTests(unittest.TestCase):
         getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete", 0)), sequence({"response": []}))
         report, _ = verify(getters, task_id="t")
         self.assertFalse(report.ok)
+
+
+REAL_TASK_DATA = (
+    '{"discoveryId":"581","note":"For further details on the discovery job use discoveryId and '
+    'jobTaskId.","jobTaskId":"1792754668237","status":"Success"}'
+)
+REAL_TASK = {
+    "response": {
+        "data": REAL_TASK_DATA,
+        "progress": "581",
+        "isError": False,
+        "endTime": 1792754671554,
+        "id": "task-1",
+    }
+}
+# The one entry the real controller returned from /discovery/{id}/job: no IP, no statuses.
+REAL_JOB_ENTRY = {"response": [{"id": "job-1", "name": "mynewdemo-default", "secret": "do-not-print"}]}
+
+
+class NotFound(Exception):
+    status_code = 404
+
+
+def devices_response(*entries):
+    return {"response": list(entries)}
+
+
+class DeviceResultsTests(unittest.TestCase):
+    def test_parse_task_result(self) -> None:
+        self.assertEqual(parse_task_result(REAL_TASK["response"]), ("581", "1792754668237"))
+        self.assertEqual(parse_task_result({"progress": "574"}), ("574", ""))
+        self.assertEqual(parse_task_result({"data": "not json", "progress": "7"}), ("7", ""))
+        self.assertEqual(parse_task_result({"data": {"discoveryId": 9, "jobTaskId": 3}}), ("9", "3"))
+        self.assertEqual(parse_task_result({}), ("", ""))
+
+    def test_discovery_id_comes_from_the_task_data(self) -> None:
+        seen = []
+
+        def get_discovery(discovery_id):
+            seen.append(discovery_id)
+            return discovery("Complete")
+
+        getters = ApiGetters(sequence(REAL_TASK), get_discovery, sequence(GOOD_JOBS))
+        report, _ = verify(getters, task_id="task-1")
+        self.assertEqual(seen, ["581"])
+        self.assertTrue(report.ok, report.lines)
+
+    def test_summary_results_are_preferred_and_show_netconf(self) -> None:
+        devices = devices_response(
+            {"ipAddress": "10.0.0.1", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+             "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"},
+            {"ipAddress": "10.0.0.2", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+             "cliStatus": "SUCCESS", "netconfStatus": "FAILURE"},
+        )
+
+        def no_jobs(_id):
+            raise AssertionError("the /job call must not be used when /summary has results")
+
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), no_jobs, sequence(devices))
+        report, _ = verify(getters, task_id="task-1")
+        text = "\n".join(report.lines)
+        self.assertFalse(report.ok)
+        self.assertIn("OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS", text)
+        self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE", text)
+        self.assertEqual(report.raw["devices"], devices)
+        self.assertNotIn("jobs", report.raw)
+
+    def test_falls_back_to_the_job_call_when_summary_fails_or_is_empty(self) -> None:
+        def broken(_id):
+            raise NotFound("no such call")
+
+        for devices in (broken, sequence({"response": []})):
+            getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(GOOD_JOBS), devices)
+            report, _ = verify(getters, task_id="task-1")
+            self.assertTrue(report.ok, report.lines)
+            self.assertEqual(report.raw["jobs"], GOOD_JOBS)
+
+    def test_unrecognised_entry_lists_field_names_and_never_values(self) -> None:
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete")), sequence(REAL_JOB_ENTRY))
+        report, _ = verify(getters, task_id="task-1")
+        text = "\n".join(report.lines)
+        self.assertFalse(report.ok)
+        self.assertIn("unrecognised result (fields: id, name, secret); run with --raw", text)
+        self.assertNotIn("do-not-print", text)
+        self.assertNotIn("ping=-", text)
+
+    def test_count_mismatch_is_noted(self) -> None:
+        lines, ok = summarize_jobs(GOOD_JOBS["response"], expected=3)
+        self.assertTrue(ok)
+        self.assertIn("note: the discovery reports 3 device(s) but 2 result(s) were returned", lines[-1])
+        self.assertEqual(len(summarize_jobs(GOOD_JOBS["response"], expected=2)[0]), 2)
+
+    def test_deleted_discovery_gets_a_clear_message(self) -> None:
+        def missing(_id):
+            raise NotFound("Request data not found")
+
+        report, _ = verify(ApiGetters(sequence(REAL_TASK), missing, sequence()), task_id="task-1")
+        self.assertFalse(report.ok)
+        self.assertEqual(report.lines[-1], "Discovery 581 was not found (it may have been deleted in Catalyst Center)")
+
+    def test_other_discovery_errors_are_still_reported_as_verification_failures(self) -> None:
+        def boom(_id):
+            raise RuntimeError("network down")
+
+        report, _ = verify(ApiGetters(sequence(REAL_TASK), boom, sequence()), task_id="task-1")
+        self.assertIn("Verification failed: RuntimeError: network down", report.lines[-1])
 
 
 class ReportingTests(unittest.TestCase):

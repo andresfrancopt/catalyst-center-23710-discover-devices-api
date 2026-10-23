@@ -43,6 +43,8 @@ from test_discovery_common import (
     GOOD_JOBS,
     NCIM_FAILED_TASK,
     OK_TASK,
+    REAL_JOB_ENTRY,
+    REAL_TASK,
     RUNNING_TASK,
     FakeTime,
     discovery,
@@ -475,6 +477,96 @@ class DiscoveryScriptTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Standalone task checker
 # ---------------------------------------------------------------------------
+
+
+class DeviceResultsTests(unittest.TestCase):
+    """The per-device step in the three standalone scripts that report devices."""
+
+    NETCONF_DEVICES = {"response": [
+        {"ipAddress": "10.0.0.1", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+         "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"},
+        {"ipAddress": "10.0.0.2", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+         "cliStatus": "SUCCESS", "netconfStatus": "FAILURE"}]}
+
+    def reports(self, api):
+        """One report per script, each fed the same fake controller."""
+        fake = FakeTime()
+        yield "discover_ips", ips_mod.follow_job(api, "p", "t1", 60, sleep=fake.sleep, clock=fake.clock)
+        yield "discover_csv", csv_mod.follow_job(api, "p", "t1", 60, sleep=fake.sleep, clock=fake.clock)
+        yield "check_task", task_mod.check(api, "t1", None, True, 60, sleep=fake.sleep, clock=fake.clock)
+
+    def api(self, devices=None, jobs=GOOD_JOBS, discovery_error=None):
+        api = MagicMock()
+        api.task.get_task_by_id.return_value = REAL_TASK
+        if discovery_error:
+            api.discovery.get_discovery_by_id.side_effect = discovery_error
+        else:
+            api.discovery.get_discovery_by_id.return_value = discovery("Complete")
+        if isinstance(devices, Exception):
+            api.discovery.get_network_devices_from_discovery.side_effect = devices
+        elif devices is not None:
+            api.discovery.get_network_devices_from_discovery.return_value = devices
+        api.discovery.get_list_of_discoveries_by_discovery_id.return_value = jobs
+        return api
+
+    def test_task_data_gives_the_discovery_id(self) -> None:
+        for mod in (ips_mod, csv_mod, task_mod):
+            self.assertEqual(mod.parse_task_result(REAL_TASK["response"]), ("581", "1792754668237"))
+            self.assertEqual(mod.parse_task_result({"progress": "7"}), ("7", ""))
+            self.assertEqual(mod.parse_task_result({"data": "not json", "progress": "7"}), ("7", ""))
+        for name, report in self.reports(self.api(self.NETCONF_DEVICES)):
+            with self.subTest(script=name):
+                self.assertIn('Discovery 581 "discover-default"', "\n".join(report.lines))
+
+    def test_summary_results_show_netconf_and_replace_the_job_call(self) -> None:
+        for name, report in self.reports(self.api(self.NETCONF_DEVICES)):
+            with self.subTest(script=name):
+                text = "\n".join(report.lines)
+                self.assertFalse(report.ok)
+                self.assertIn("OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS", text)
+                self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE", text)
+                self.assertIn("devices", report.raw)
+                self.assertNotIn("jobs", report.raw)
+
+    def test_falls_back_to_the_job_call(self) -> None:
+        for devices in (catalystcentersdkException("no such call"), {"response": []}):
+            for name, report in self.reports(self.api(devices)):
+                with self.subTest(script=name, devices=type(devices).__name__):
+                    self.assertTrue(report.ok, report.lines)
+                    self.assertEqual(report.raw["jobs"], GOOD_JOBS)
+
+    def test_unrecognised_entry_lists_field_names_only(self) -> None:
+        for name, report in self.reports(self.api(devices={"response": []}, jobs=REAL_JOB_ENTRY)):
+            with self.subTest(script=name):
+                text = "\n".join(report.lines)
+                self.assertFalse(report.ok)
+                self.assertIn("unrecognised result (fields: id, name, secret); run with --raw", text)
+                self.assertNotIn("do-not-print", text)
+
+    def test_deleted_discovery_gets_a_clear_message(self) -> None:
+        class Gone(catalystcentersdkException):
+            status_code = 404
+
+        for name, report in self.reports(self.api(discovery_error=Gone("Request data not found"))):
+            with self.subTest(script=name):
+                self.assertFalse(report.ok)
+                self.assertEqual(
+                    report.lines[-1],
+                    "Discovery 581 was not found (it may have been deleted in Catalyst Center)")
+
+    def test_other_discovery_errors_stay_failures(self) -> None:
+        for name, report in self.reports(self.api(discovery_error=catalystcentersdkException("boom"))):
+            with self.subTest(script=name):
+                self.assertFalse(report.ok)
+                self.assertIn("boom", report.lines[-1])
+
+    def test_count_note_and_parity_with_the_common_module(self) -> None:
+        for entries, expected in ((GOOD_JOBS["response"], 3), (GOOD_JOBS["response"], 2),
+                                  (REAL_JOB_ENTRY["response"], 2), (self.NETCONF_DEVICES["response"], None)):
+            want = common.summarize_jobs(entries, expected)
+            for mod in (ips_mod, csv_mod, task_mod):
+                self.assertEqual(mod.summarize_devices(entries, expected), want)
+        self.assertEqual(common.parse_task_result(REAL_TASK["response"]), ("581", "1792754668237"))
 
 
 class CheckTaskTests(unittest.TestCase):

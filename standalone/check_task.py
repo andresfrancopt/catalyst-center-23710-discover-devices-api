@@ -237,12 +237,44 @@ def _poll(fetch: Callable[[], Any], done: Callable[[Any], bool], deadline: float
         sleep(min(interval, remaining))
 
 
-def summarize_devices(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
-    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried)."""
+def parse_task_result(body: Mapping[str, Any]) -> tuple[str, str]:
+    """(discovery ID, job task ID) from a finished discovery task; either may be ''."""
+    # The task's 'data' is a JSON string such as {"discoveryId": "581", "jobTaskId": "..."};
+    # older results only carry the discovery ID in 'progress'.
+    data = body.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    if not isinstance(data, Mapping):
+        data = {}
+    discovery_id = str(data.get("discoveryId") or body.get("progress") or "").strip()
+    return discovery_id, str(data.get("jobTaskId") or "").strip()
+
+
+_IP_FIELDS = ("ipAddress", "managementIpAddress", "deviceIp")
+_STATUS_FIELDS = ("pingStatus", "snmpStatus", "cliStatus", "netconfStatus")
+
+
+def summarize_devices(jobs: Sequence[Mapping[str, Any]], expected: int | None = None) -> tuple[list[str], bool]:
+    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried).
+
+    expected is the device count the discovery reports; a different number of results
+    only adds a note.
+    """
     if not jobs:
         return ["- no per-IP results were returned"], False
     lines, all_ok = [], True
     for job in jobs:
+        ip = next((str(job[n]) for n in _IP_FIELDS if job.get(n)), "")
+        # An entry with no IP and no status is not a per-device result: show its field names
+        # (never values) instead of a row of '?' and '-'.
+        if not ip and not any(job.get(n) for n in _STATUS_FIELDS):
+            names = ", ".join(sorted(str(key) for key in job)) or "none"
+            lines.append("- unrecognised result (fields: {}); run with --raw".format(names))
+            all_ok = False
+            continue
         status = {key: str(job.get(name) or "-")
                   for key, name in (("ping", "pingStatus"), ("snmp", "snmpStatus"), ("cli", "cliStatus"))}
         ok = all(value.strip().lower() == "success" for value in status.values())
@@ -254,10 +286,30 @@ def summarize_devices(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], boo
         all_ok = all_ok and ok
         detail = next((str(job[n]) for n in ("errorDescription", "errDescription", "errorCode") if job.get(n)), "")
         lines.append("- {ip:<15} {state}  {protocols}{detail}".format(
-            ip=str(job.get("ipAddress") or "?"), state="OK       " if ok else "ATTENTION",
+            ip=ip or "?", state="OK       " if ok else "ATTENTION",
             protocols=" ".join("{}={}".format(key, value) for key, value in status.items()),
             detail=": " + detail if detail else ""))
+    if expected is not None and expected != len(jobs):
+        lines.append("- note: the discovery reports {} device(s) but {} result(s) were returned".format(
+            expected, len(jobs)))
     return lines, all_ok
+
+
+def fetch_device_results(api: CatalystCenterAPI, discovery_id: str, raw: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """Per-device results: /summary first, then /job. The responses read go into raw."""
+    # GET /dna/intent/api/v1/discovery/{id}/summary has the per-device protocol statuses.
+    try:
+        devices = api.discovery.get_network_devices_from_discovery(discovery_id)
+        raw["devices"] = devices
+        items = _items(devices)
+        if items:
+            return items
+    except (catalystcentersdkException, requests.RequestException) as exc:  # fall back to /job below
+        raw["devices_error"] = "{}: {}".format(type(exc).__name__, exc)
+    # GET /dna/intent/api/v1/discovery/{id}/job
+    jobs = api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
+    raw["jobs"] = jobs
+    return _items(jobs)
 
 
 def follow_discovery(api: CatalystCenterAPI, report: Report, discovery_id: str, deadline: float,
@@ -265,10 +317,18 @@ def follow_discovery(api: CatalystCenterAPI, report: Report, discovery_id: str, 
                      clock: Callable[[], float], hint: str) -> None:
     """Wait for a discovery to finish, then add its per-IP results to the report."""
     # Wait for the discovery to stop running (GET /dna/intent/api/v1/discovery/{id}).
-    discovery, finished = _poll(
-        lambda: api.discovery.get_discovery_by_id(discovery_id),
-        lambda d: str(_body(d).get("discoveryCondition") or "").strip().lower() not in _RUNNING_CONDITIONS,
-        deadline, interval, sleep, clock)
+    # [error handling] A 404 means the discovery no longer exists.
+    try:
+        discovery, finished = _poll(
+            lambda: api.discovery.get_discovery_by_id(discovery_id),
+            lambda d: str(_body(d).get("discoveryCondition") or "").strip().lower() not in _RUNNING_CONDITIONS,
+            deadline, interval, sleep, clock)
+    except catalystcentersdkException as exc:
+        if getattr(exc, "status_code", None) != 404:
+            raise
+        report.lines.append("Discovery {} was not found (it may have been deleted in Catalyst Center)"
+                            .format(discovery_id))
+        return
     report.raw["discovery"] = discovery
     info = _body(discovery)
     header = 'Discovery {} "{}": {}, {} device(s)'.format(
@@ -277,11 +337,14 @@ def follow_discovery(api: CatalystCenterAPI, report: Report, discovery_id: str, 
     if not finished:
         report.lines.append(header + ". Still running after {}s; check later with: {}".format(int(timeout), hint))
         return
-    # One result per device (ping, SNMP and CLI). The job is OK only if all of them
-    # succeeded (GET /dna/intent/api/v1/discovery/{id}/job).
-    jobs = api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
-    report.raw["jobs"] = jobs
-    device_lines, report.ok = summarize_devices(_items(jobs))
+    # One result per device (ping, SNMP, CLI and NETCONF if used). The job is OK only if all of
+    # them succeeded.
+    results = fetch_device_results(api, discovery_id, report.raw)
+    try:
+        expected = int(info.get("numDevices"))
+    except (TypeError, ValueError):
+        expected = None
+    device_lines, report.ok = summarize_devices(results, expected)
     report.lines.append(header)
     report.lines.extend(device_lines)
 
@@ -324,7 +387,7 @@ def check(api: CatalystCenterAPI, task_id: str | None, discovery_id: str | None,
         report.lines.append("Task {} completed: {}".format(task_id, _short(body.get("progress") or "no result text")))
         # For a discovery task, the result of a finished task is the discovery ID.
         if follow:
-            discovery_id = str(body.get("progress") or "").strip()
+            discovery_id = parse_task_result(body)[0]
             if not discovery_id:
                 report.ok = False
                 report.lines.append("The task result has no discovery ID, so the devices cannot be checked "

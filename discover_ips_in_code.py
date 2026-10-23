@@ -160,6 +160,9 @@ def main() -> int:
             get_jobs=lambda discovery_id: (
                 api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
             ),
+            get_devices=lambda discovery_id: (
+                api.discovery.get_network_devices_from_discovery(discovery_id)
+            ),
         )
         reports = verify_submitted(results, getters, args.timeout)
     # [error handling] Expected problems (bad settings, a failed submission, an SDK or network

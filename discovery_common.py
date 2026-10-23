@@ -515,11 +515,17 @@ _SENSITIVE_KEY_PARTS = ("password", "passphrase", "community", "secret", "token"
 
 @dataclass(frozen=True)
 class ApiGetters:
-    """The three read calls verification needs; SDK and requests both provide them."""
+    """The read calls verification needs; SDK and requests both provide them.
+
+    get_devices is the preferred per-device call (/discovery/{id}/summary, which has the
+    ping/SNMP/CLI/NETCONF status per IP);
+    get_jobs (/discovery/{id}/job) is used when it is missing, fails or is empty.
+    """
 
     get_task: Callable[[str], Any]
     get_discovery: Callable[[str], Any]
     get_jobs: Callable[[str], Any]
+    get_devices: Callable[[str], Any] | None = None
 
 
 @dataclass
@@ -653,14 +659,51 @@ def _poll(
         sleep(min(interval, remaining))
 
 
-def summarize_jobs(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
-    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried)."""
+def parse_task_result(body: Mapping[str, Any]) -> tuple[str, str]:
+    """(discovery ID, job task ID) from a finished discovery task; either may be ''."""
+    # The task's 'data' is a JSON string such as {"discoveryId": "581", "jobTaskId": "..."};
+    # older results only carry the discovery ID in 'progress'.
+    data = body.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    if not isinstance(data, Mapping):
+        data = {}
+    discovery_id = str(data.get("discoveryId") or body.get("progress") or "").strip()
+    return discovery_id, str(data.get("jobTaskId") or "").strip()
+
+
+def _not_found(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 404
+
+
+_IP_FIELDS = ("ipAddress", "managementIpAddress", "deviceIp")
+_STATUS_FIELDS = ("pingStatus", "snmpStatus", "cliStatus", "netconfStatus")
+
+
+def summarize_jobs(jobs: Sequence[Mapping[str, Any]], expected: int | None = None) -> tuple[list[str], bool]:
+    """One line per IP; ok only when ping, SNMP and CLI all succeeded (and NETCONF, if it was tried).
+
+    expected is the device count the discovery reports; a different number of results
+    only adds a note.
+    """
     if not jobs:
         return ["- no per-IP results were returned"], False
 
     lines: list[str] = []
     all_ok = True
     for job in jobs:
+        ip = next((str(job[name]) for name in _IP_FIELDS if job.get(name)), "")
+        # An entry with no IP and no status is not a per-device result: show its field names
+        # (never values) instead of a row of '?' and '-'.
+        if not ip and not any(job.get(name) for name in _STATUS_FIELDS):
+            names = ", ".join(sorted(str(key) for key in job)) or "none"
+            lines.append("- unrecognised result (fields: {}); run with --raw".format(names))
+            all_ok = False
+            continue
         statuses = {
             key: str(job.get(field_name) or "-")
             for key, field_name in (("ping", "pingStatus"), ("snmp", "snmpStatus"), ("cli", "cliStatus"))
@@ -682,13 +725,32 @@ def summarize_jobs(jobs: Sequence[Mapping[str, Any]]) -> tuple[list[str], bool]:
         )
         lines.append(
             "- {ip:<15} {state}  {protocols}{detail}".format(
-                ip=str(job.get("ipAddress") or "?"),
+                ip=ip or "?",
                 state="OK       " if ok else "ATTENTION",
                 protocols=" ".join("{}={}".format(key, value) for key, value in statuses.items()),
                 detail=": " + detail if detail else "",
             )
         )
+    if expected is not None and expected != len(jobs):
+        lines.append("- note: the discovery reports {} device(s) but {} result(s) were returned".format(
+            expected, len(jobs)))
     return lines, all_ok
+
+
+def fetch_device_results(getters: ApiGetters, discovery_id: str, raw: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """Per-device results: /summary first, then /job. The responses read go into raw."""
+    if getters.get_devices is not None:
+        try:
+            devices = getters.get_devices(discovery_id)
+            raw["devices"] = devices
+            items = response_items(devices)
+            if items:
+                return items
+        except Exception as exc:  # fall back to the /job call below
+            raw["devices_error"] = "{}: {}".format(type(exc).__name__, exc)
+    jobs = getters.get_jobs(discovery_id)
+    raw["jobs"] = jobs
+    return response_items(jobs)
 
 
 def verify_job(
@@ -733,7 +795,7 @@ def verify_job(
                     )
                 )
                 return report
-            discovery_id = str(body.get("progress") or "").strip() or None
+            discovery_id = parse_task_result(body)[0] or None
             if not discovery_id:
                 report.lines.append(
                     "Task {} completed but its result has no discovery ID, so the devices "
@@ -743,15 +805,23 @@ def verify_job(
             report.lines.append("Task {} completed".format(task_id))
 
         # Step 2: the finished task's result is the discovery ID; wait until that
-        # discovery stops running.
-        discovery, finished = _poll(
-            lambda: getters.get_discovery(discovery_id),
-            lambda response: not _discovery_running(response),
-            deadline,
-            interval,
-            sleep,
-            clock,
-        )
+        # discovery stops running. [error handling] A 404 means it no longer exists.
+        try:
+            discovery, finished = _poll(
+                lambda: getters.get_discovery(discovery_id),
+                lambda response: not _discovery_running(response),
+                deadline,
+                interval,
+                sleep,
+                clock,
+            )
+        except Exception as exc:
+            if not _not_found(exc):
+                raise
+            report.lines.append(
+                "Discovery {} was not found (it may have been deleted in Catalyst Center)".format(discovery_id)
+            )
+            return report
         report.raw["discovery"] = discovery
         info = _body(discovery)
         header = 'Discovery {} "{}": {}, {} device(s)'.format(
@@ -767,11 +837,14 @@ def verify_job(
             )
             return report
 
-        # Step 3: one result per device (ping, SNMP and CLI). The job is OK only if all of
-        # them succeeded.
-        jobs = getters.get_jobs(discovery_id)
-        report.raw["jobs"] = jobs
-        job_lines, report.ok = summarize_jobs(response_items(jobs))
+        # Step 3: one result per device (ping, SNMP, CLI and NETCONF if used). The job is OK
+        # only if all of them succeeded.
+        results = fetch_device_results(getters, discovery_id, report.raw)
+        try:
+            expected = int(info.get("numDevices"))
+        except (TypeError, ValueError):
+            expected = None
+        job_lines, report.ok = summarize_jobs(results, expected)
         report.lines.append(header)
         report.lines.extend(job_lines)
     # [error handling] Turn any failure into a PROBLEM line, so the other jobs are still
