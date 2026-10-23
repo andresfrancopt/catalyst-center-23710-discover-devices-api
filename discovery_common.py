@@ -515,11 +515,16 @@ _SENSITIVE_KEY_PARTS = ("password", "passphrase", "community", "secret", "token"
 
 @dataclass(frozen=True)
 class ApiGetters:
-    """The read calls verification needs; SDK and requests both provide them."""
+    """The read calls verification needs; SDK and requests both provide them.
+
+    get_devices (/discovery/{id}/network-device, per-device protocol statuses) is tried
+    first when given; get_jobs (/discovery/{id}/job) is the fallback.
+    """
 
     get_task: Callable[[str], Any]
     get_discovery: Callable[[str], Any]
     get_jobs: Callable[[str], Any]
+    get_devices: Callable[[str], Any] | None = None
 
 
 @dataclass
@@ -727,11 +732,13 @@ def summarize_jobs(jobs: Sequence[Mapping[str, Any]], num_devices: int | None = 
             ),
             "",
         )
+        host = str(job.get("hostname") or "").strip()
         lines.append(
-            "- {ip:<15} {state}  {protocols}{detail}".format(
+            "- {ip:<15} {state}  {protocols}{host}{detail}".format(
                 ip=ip or "?",
                 state="OK       " if ok else "ATTENTION",
                 protocols=" ".join("{}={}".format(key, value) for key, value in statuses.items()),
+                host=" ({})".format(host) if host else "",
                 detail=": " + detail if detail else "",
             )
         )
@@ -742,6 +749,27 @@ def summarize_jobs(jobs: Sequence[Mapping[str, Any]], num_devices: int | None = 
             "Catalyst Center GUI or the inventory (standalone/list_devices.py)"
         )
     return lines, all_ok
+
+
+def _has_device_fields(entry: Mapping[str, Any]) -> bool:
+    return any(entry.get(name) for name in _IP_FIELDS + _STATUS_FIELDS)
+
+
+def fetch_device_results(getters: ApiGetters, discovery_id: str, raw: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """Per-device results: /network-device first, then the /job record. Responses read go into raw."""
+    if getters.get_devices is not None:
+        try:
+            devices = getters.get_devices(discovery_id)
+            raw["devices"] = devices
+            items = response_items(devices)
+            # Only entries that really describe devices count; anything else falls back to /job.
+            if any(_has_device_fields(item) for item in items):
+                return items
+        except Exception as exc:  # fall back to the /job call below
+            raw["devices_error"] = "{}: {}".format(type(exc).__name__, exc)
+    jobs = getters.get_jobs(discovery_id)
+    raw["jobs"] = jobs
+    return response_items(jobs)
 
 
 def verify_job(
@@ -828,16 +856,15 @@ def verify_job(
             )
             return report
 
-        # Step 3: the discovery job result (GET /discovery/{id}/job). The job is OK when it
-        # succeeded and devices were found; per-IP statuses are shown only if the controller
-        # returns them.
-        jobs = getters.get_jobs(discovery_id)
-        report.raw["jobs"] = jobs
+        # Step 3: per-device results (GET /discovery/{id}/network-device, ping/SNMP/CLI/NETCONF
+        # status per device), or the discovery job record (GET /discovery/{id}/job) if the
+        # controller does not return them. The job is OK when it succeeded and devices were found.
+        results = fetch_device_results(getters, discovery_id, report.raw)
         try:
             num_devices = int(info.get("numDevices"))
         except (TypeError, ValueError):
             num_devices = None
-        job_lines, report.ok = summarize_jobs(response_items(jobs), num_devices)
+        job_lines, report.ok = summarize_jobs(results, num_devices)
         report.lines.append(header)
         report.lines.extend(job_lines)
     # [error handling] Turn any failure into a PROBLEM line, so the other jobs are still

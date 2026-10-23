@@ -584,15 +584,35 @@ def summarize_devices(jobs: Sequence[Mapping[str, Any]], num_devices: int | None
             ok = ok and netconf.lower() == "success"
         all_ok = all_ok and ok
         detail = next((str(job[n]) for n in ("errorDescription", "errDescription", "errorCode") if job.get(n)), "")
-        lines.append("- {ip:<15} {state}  {protocols}{detail}".format(
+        host = str(job.get("hostname") or "").strip()
+        lines.append("- {ip:<15} {state}  {protocols}{host}{detail}".format(
             ip=ip or "?", state="OK       " if ok else "ATTENTION",
             protocols=" ".join("{}={}".format(key, value) for key, value in status.items()),
+            host=" ({})".format(host) if host else "",
             detail=": " + detail if detail else ""))
     if not detailed:
         lines.append("- note: per-device and per-credential results are not available from Catalyst Center "
                      "here; to confirm which protocols (SSH, SNMP, NETCONF) worked, check the discovery in "
                      "the Catalyst Center GUI or the inventory (standalone/list_devices.py)")
     return lines, all_ok
+
+
+def fetch_device_results(api: CatalystCenterAPI, discovery_id: str, raw: dict[str, Any]) -> list[Mapping[str, Any]]:
+    """Per-device results: /network-device first, then the /job record. Responses read go into raw."""
+    # GET /dna/intent/api/v1/discovery/{id}/network-device has ping/SNMP/CLI/NETCONF status per device.
+    try:
+        devices = api.discovery.get_discovered_network_devices_by_discovery_id(discovery_id)
+        raw["devices"] = devices
+        items = response_items(devices)
+        # Only entries that really describe devices count; anything else falls back to /job.
+        if any(item.get(n) for item in items for n in _IP_FIELDS + _STATUS_FIELDS):
+            return items
+    except (catalystcentersdkException, requests.RequestException) as exc:  # fall back to /job below
+        raw["devices_error"] = "{}: {}".format(type(exc).__name__, exc)
+    # GET /dna/intent/api/v1/discovery/{id}/job
+    jobs = api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
+    raw["jobs"] = jobs
+    return response_items(jobs)
 
 
 def follow_job(api: CatalystCenterAPI, label: str, task_id: str, timeout: float,
@@ -653,16 +673,15 @@ def follow_job(api: CatalystCenterAPI, label: str, task_id: str, timeout: float,
                                 "python check_task.py {} --discovery".format(int(timeout), task_id))
             return report
 
-        # Step 3: the discovery job result (GET /dna/intent/api/v1/discovery/{id}/job). The job is OK
-        # when it succeeded and devices were found; per-IP statuses are shown only if the
-        # controller returns them.
-        jobs = api.discovery.get_list_of_discoveries_by_discovery_id(discovery_id)
-        report.raw["jobs"] = jobs
+        # Step 3: per-device results (GET /dna/intent/api/v1/discovery/{id}/network-device: ping, SNMP,
+        # CLI and NETCONF status per device), or the discovery job record (GET .../discovery/{id}/job)
+        # if the controller does not return them. The job is OK when it succeeded and devices were found.
+        results = fetch_device_results(api, discovery_id, report.raw)
         try:
             num_devices = int(info.get("numDevices"))
         except (TypeError, ValueError):
             num_devices = None
-        device_lines, report.ok = summarize_devices(response_items(jobs), num_devices)
+        device_lines, report.ok = summarize_devices(results, num_devices)
         report.lines.append(header)
         report.lines.extend(device_lines)
     # [error handling] Turn a failure into a PROBLEM line, so the other jobs are still reported.

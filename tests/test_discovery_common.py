@@ -515,6 +515,18 @@ NETCONF_JOBS = {"response": [
      "cliStatus": "SUCCESS", "netconfStatus": "SUCCESS"},
     {"ipAddress": "10.0.0.2", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
      "cliStatus": "SUCCESS", "netconfStatus": "FAILURE"}]}
+# Shaped like the 2.3.7.9 spec for GET /discovery/{id}/network-device.
+SPEC_DEVICES = {"response": [
+    {"managementIpAddress": "10.48.90.173", "hostname": "sw1", "pingStatus": "SUCCESS",
+     "snmpStatus": "SUCCESS", "cliStatus": "SUCCESS", "httpStatus": "FAILURE",
+     "netconfStatus": "SUCCESS", "inventoryCollectionStatus": "Managed"},
+    {"managementIpAddress": "10.48.90.174", "hostname": "sw2", "pingStatus": "SUCCESS",
+     "snmpStatus": "SUCCESS", "cliStatus": "SUCCESS", "httpStatus": "NOT-PROVIDED",
+     "netconfStatus": "FAILURE", "errorDescription": "NETCONF connection refused"}]}
+
+
+def _no_jobs(_id):
+    raise AssertionError("the /job call must not be used when /network-device has device entries")
 
 
 class NotFound(Exception):
@@ -581,6 +593,59 @@ class DeviceResultsTests(unittest.TestCase):
         self.assertFalse(report.ok)
         self.assertIn("unrecognised result (fields: id, name, secret); run with --raw", text)
         self.assertNotIn("do-not-print", text)
+
+    def test_network_device_results_show_hostname_and_netconf_per_device(self) -> None:
+        getters = ApiGetters(sequence(REAL_TASK), sequence(discovery("Complete")), _no_jobs, sequence(SPEC_DEVICES))
+        report, _ = verify(getters, task_id="task-1")
+        text = "\n".join(report.lines)
+        self.assertFalse(report.ok)
+        self.assertIn("10.48.90.173    OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=SUCCESS (sw1)", text)
+        self.assertIn(
+            "10.48.90.174    ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS netconf=FAILURE (sw2): "
+            "NETCONF connection refused", text)
+        self.assertNotIn("http", text.lower())
+        self.assertNotIn("not available", text)
+        self.assertEqual(report.raw["devices"], SPEC_DEVICES)
+        self.assertNotIn("jobs", report.raw)
+
+    def test_netconf_that_was_not_tried_is_not_shown(self) -> None:
+        devices = {"response": [{"managementIpAddress": "10.0.0.1", "hostname": "r1", "pingStatus": "SUCCESS",
+                                 "snmpStatus": "SUCCESS", "cliStatus": "SUCCESS", "netconfStatus": "NOT-PROVIDED"}]}
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete", 1)), _no_jobs, sequence(devices))
+        report, _ = verify(getters, task_id="task-1")
+        self.assertTrue(report.ok, report.lines)
+        self.assertNotIn("netconf", "\n".join(report.lines))
+
+    def test_a_cli_failure_is_flagged_with_its_error(self) -> None:
+        devices = {"response": [{"managementIpAddress": "10.0.0.1", "pingStatus": "SUCCESS", "snmpStatus": "SUCCESS",
+                                 "cliStatus": "FAILURE", "errorDescription": "login failed"}]}
+        getters = ApiGetters(sequence(OK_TASK), sequence(discovery("Complete", 1)), _no_jobs, sequence(devices))
+        report, _ = verify(getters, task_id="task-1")
+        self.assertFalse(report.ok)
+        self.assertIn("ATTENTION  ping=SUCCESS snmp=SUCCESS cli=FAILURE: login failed", "\n".join(report.lines))
+
+    def test_falls_back_to_the_job_record_when_network_device_is_unusable(self) -> None:
+        def broken(_id):
+            raise NotFound("no such call")
+
+        for devices in (broken, sequence({"response": []}), sequence({"response": 2}),
+                        sequence(UNRECOGNISED_ENTRY)):
+            getters = ApiGetters(sequence(REAL_TASK), sequence(discovery("Complete")),
+                                 sequence(REAL_JOB_ENTRY), devices)
+            report, _ = verify(getters, task_id="task-1")
+            text = "\n".join(report.lines)
+            self.assertTrue(report.ok, report.lines)
+            self.assertIn("- discovery job status: SUCCESS", text)
+            self.assertIn("not available from Catalyst Center", text)
+            self.assertEqual(report.raw["jobs"], REAL_JOB_ENTRY)
+
+    def test_failed_network_device_call_is_kept_in_raw_output(self) -> None:
+        def broken(_id):
+            raise NotFound("no such call")
+
+        getters = ApiGetters(sequence(REAL_TASK), sequence(discovery("Complete")), sequence(REAL_JOB_ENTRY), broken)
+        report, _ = verify(getters, task_id="task-1")
+        self.assertIn("NotFound: no such call", report.raw["devices_error"])
 
     def test_summarize_jobs_directly(self) -> None:
         self.assertEqual(summarize_jobs([], 2)[1], False)

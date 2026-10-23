@@ -46,6 +46,7 @@ from test_discovery_common import (
     REAL_JOB_ENTRY,
     REAL_TASK,
     RUNNING_TASK,
+    SPEC_DEVICES,
     UNRECOGNISED_ENTRY,
     FakeTime,
     discovery,
@@ -496,15 +497,43 @@ class DeviceResultsTests(unittest.TestCase):
         yield "discover_csv", csv_mod.follow_job(api, "p", "t1", 60, sleep=fake.sleep, clock=fake.clock)
         yield "check_task", task_mod.check(api, "t1", None, True, 60, sleep=fake.sleep, clock=fake.clock)
 
-    def api(self, jobs=GOOD_JOBS, discovery_error=None):
+    def api(self, jobs=GOOD_JOBS, discovery_error=None, devices=None):
         api = MagicMock()
         api.task.get_task_by_id.return_value = REAL_TASK
         if discovery_error:
             api.discovery.get_discovery_by_id.side_effect = discovery_error
         else:
             api.discovery.get_discovery_by_id.return_value = discovery("Complete")
+        if isinstance(devices, Exception):
+            api.discovery.get_discovered_network_devices_by_discovery_id.side_effect = devices
+        elif devices is not None:
+            api.discovery.get_discovered_network_devices_by_discovery_id.return_value = devices
         api.discovery.get_list_of_discoveries_by_discovery_id.return_value = jobs
         return api
+
+    def test_network_device_results_show_hostname_and_netconf_per_device(self) -> None:
+        for name, report in self.reports(self.api(devices=SPEC_DEVICES)):
+            with self.subTest(script=name):
+                text = "\n".join(report.lines)
+                self.assertFalse(report.ok)
+                self.assertIn("10.48.90.173    OK         ping=SUCCESS snmp=SUCCESS cli=SUCCESS "
+                              "netconf=SUCCESS (sw1)", text)
+                self.assertIn("10.48.90.174    ATTENTION  ping=SUCCESS snmp=SUCCESS cli=SUCCESS "
+                              "netconf=FAILURE (sw2): NETCONF connection refused", text)
+                self.assertNotIn("not available", text)
+                self.assertEqual(report.raw["devices"], SPEC_DEVICES)
+                self.assertNotIn("jobs", report.raw)
+
+    def test_falls_back_to_the_job_record_when_network_device_is_unusable(self) -> None:
+        for devices in (catalystcentersdkException("no such call"), {"response": []}, {"response": 2},
+                        UNRECOGNISED_ENTRY):
+            for name, report in self.reports(self.api(REAL_JOB_ENTRY, devices=devices)):
+                with self.subTest(script=name, devices=type(devices).__name__):
+                    text = "\n".join(report.lines)
+                    self.assertTrue(report.ok, report.lines)
+                    self.assertIn("- discovery job status: SUCCESS", text)
+                    self.assertIn("not available from Catalyst Center", text)
+                    self.assertEqual(report.raw["jobs"], REAL_JOB_ENTRY)
 
     def test_task_data_gives_the_discovery_id(self) -> None:
         for mod in (ips_mod, csv_mod, task_mod):
@@ -573,6 +602,7 @@ class DeviceResultsTests(unittest.TestCase):
         for entries, num_devices in ((GOOD_JOBS["response"], 3), (GOOD_JOBS["response"], 2),
                                      (REAL_JOB_ENTRY["response"], 2), (REAL_JOB_ENTRY["response"], 0),
                                      (UNRECOGNISED_ENTRY["response"], 2), ([], 2),
+                                     (SPEC_DEVICES["response"], 2),
                                      (self.NETCONF_DEVICES["response"], None)):
             want = common.summarize_jobs(entries, num_devices)
             for mod in (ips_mod, csv_mod, task_mod):
