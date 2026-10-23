@@ -21,8 +21,8 @@
 
 """Shared helpers: .env settings, credential profiles, IP validation, payloads.
 
-This module deliberately does not import the Catalyst Center SDK, so the
-non-SDK reference script can reuse it.
+This module deliberately does not import the Catalyst Center SDK, so it can be
+tested and reused without it.
 """
 
 from __future__ import annotations

@@ -31,7 +31,6 @@ from unittest.mock import MagicMock, patch
 import check_discovery
 import discover_from_csv
 import discover_ips_in_code
-import reference_discover_without_sdk
 from discovery_common import ConfigError, SDK_API_VERSION
 from test_discovery_common import BASE_ENV, GOOD_JOBS, NCIM_FAILED_TASK, OK_TASK, discovery
 
@@ -284,60 +283,6 @@ class CheckDiscoveryScriptTests(EnvironmentCase):
                 with self.assertRaises(SystemExit) as ctx:
                     self.run_check(argv)
                 self.assertEqual(ctx.exception.code, 2)
-
-
-class ReferenceScriptTests(EnvironmentCase):
-    def test_does_the_same_without_the_sdk(self) -> None:
-        base = "https://catalyst.example.test"
-        seen: list[tuple[str, str]] = []
-
-        def fake_request(method, url, **kwargs):
-            path = url.removeprefix(base)
-            seen.append((method, path))
-            self.assertEqual(kwargs["headers"], {"X-Auth-Token": "tok"})
-            self.assertIs(kwargs["verify"], True)
-            response = MagicMock()
-            if path == "/dna/intent/api/v1/global-credential":
-                kind = kwargs["params"]["credentialSubType"]
-                response.json.return_value = CLI_CREDS if kind == "CLI" else SNMP_CREDS
-            elif method == "POST" and path == "/dna/intent/api/v1/discovery":
-                response.json.return_value = {"response": {"taskId": "t1"}}
-            elif path.startswith("/dna/intent/api/v1/task/"):
-                response.json.return_value = OK_TASK
-            elif path.endswith("/job"):
-                response.json.return_value = GOOD_JOBS
-            else:
-                response.json.return_value = discovery("Complete")
-            return response
-
-        token_response = MagicMock()
-        token_response.json.return_value = {"Token": "tok"}
-        with patch.object(reference_discover_without_sdk, "DEVICES", DEVICES):
-            with patch.object(
-                reference_discover_without_sdk.requests, "post", return_value=token_response
-            ) as post:
-                with patch.object(
-                    reference_discover_without_sdk.requests, "request", side_effect=fake_request
-                ):
-                    code, out, err = run_main(reference_discover_without_sdk, [])
-
-        self.assertEqual(code, 0, out + err)
-        self.assertEqual(post.call_args.args[0], base + "/dna/system/api/v1/auth/token")
-        self.assertEqual(post.call_args.kwargs["auth"], ("api-user", "  s3cret  "))
-        self.assertEqual(
-            [item for item in seen if item[0] == "POST"],
-            [("POST", "/dna/intent/api/v1/discovery")] * 2,
-        )
-        self.assertIn(("GET", "/dna/intent/api/v1/task/t1"), seen)
-        self.assertIn("[default] OK", out)
-        self.assertIn("[branch] OK", out)
-
-    def test_dry_run_makes_no_requests(self) -> None:
-        with patch.object(reference_discover_without_sdk.requests, "post") as post:
-            code, out, _ = run_main(reference_discover_without_sdk, ["--dry-run"])
-        self.assertEqual(code, 0)
-        post.assert_not_called()
-        self.assertIn('"name": "discover-default"', out)
 
 
 if __name__ == "__main__":

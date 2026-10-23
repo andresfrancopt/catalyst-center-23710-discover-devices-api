@@ -8,7 +8,6 @@ Start Catalyst Center discovery jobs (`POST /dna/intent/api/v1/discovery`) from 
 | --- | --- | --- |
 | [discover_ips_in_code.py](discover_ips_in_code.py) | the `DEVICES` list at the top of the script | Catalyst Center SDK |
 | [discover_from_csv.py](discover_from_csv.py) | a CSV file | Catalyst Center SDK |
-| [reference_discover_without_sdk.py](reference_discover_without_sdk.py) | the `DEVICES` list (same as the first script) | plain `requests`, for comparison |
 | [check_discovery.py](check_discovery.py) | a task ID or discovery ID from an earlier run | Catalyst Center SDK |
 | [assign_devices_to_site.py](assign_devices_to_site.py) | `devices.csv` (`ip_address` + `site` columns); assigns devices to sites | Catalyst Center SDK |
 
@@ -90,7 +89,7 @@ python discover_from_csv.py devices.csv --name-prefix office
 
 ## Optional NETCONF
 
-All discovery scripts (the root ones, the reference one and the two in `standalone/`) can also use NETCONF. It is **off by default**, so nothing changes unless you ask for it:
+All discovery scripts (the root ones and the two in `standalone/`) can also use NETCONF. It is **off by default**, so nothing changes unless you ask for it:
 
 ```sh
 python discover_ips_in_code.py --netconf              # NETCONF on port 830
@@ -102,7 +101,7 @@ python standalone/discover_csv.py devices.csv --netconf --dry-run
 
 ## With vs. without the SDK
 
-`reference_discover_without_sdk.py` does the same as script 1 with `requests`. The difference:
+The [basic/](basic) folder has plain-`requests` versions of its scripts (`discover_without_sdk.py`, `get_credential_ids_without_sdk.py`) next to the SDK ones, so you can compare them side by side. The difference:
 
 - **Authentication:** the SDK requests the token from `/dna/system/api/v1/auth/token` and attaches it to every call. Without it you do the Basic-auth request and set the `X-Auth-Token` header yourself.
 - **Calling the API:** `api.discovery.start_discovery(payload=...)` versus building the URL, headers, and JSON body by hand. The same goes for the credential lookup and the task and discovery checks.
@@ -123,7 +122,7 @@ python standalone/discover_csv.py devices.csv --netconf --dry-run
   - 10.48.91.10     OK         ping=Success snmp=Success cli=Success
 ```
 
-Options for both main scripts (and the reference script):
+Options for both main scripts:
 
 - `--no-wait` submits only and prints the task IDs; check later with `check_discovery.py`.
 - `--timeout N` is how long to wait per job (default 300 seconds, polling every 5). On timeout the job is reported as a problem with the command to check it later.
